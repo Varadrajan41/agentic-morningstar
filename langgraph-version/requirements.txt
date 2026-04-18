@@ -1,0 +1,24 @@
+# Core Framework
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.0
+
+# Vector Database
+chromadb>=0.5.0
+
+# Local LLM
+ollama>=0.6.0
+
+# Web Search
+ddgs>=9.0.0
+trafilatura>=2.0.0
+
+# Hybrid Retrieval
+rank-bm25>=0.2.0
+
+# UI
+streamlit>=1.40.0
+
+# Utilities
+pydantic>=2.0.0
+python-dotenv>=1.0.0
