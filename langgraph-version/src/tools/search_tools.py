@@ -6,6 +6,9 @@ from ddgs import DDGS
 import trafilatura
 
 from src.config import WEB_SEARCH_MAX_RESULTS
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> List[Dict]:
@@ -35,7 +38,7 @@ def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> List[Di
                 for r in results
             ]
     except Exception as e:
-        print(f"Web search error: {e}")
+        logger.warning(f"Web search error: {e}")
         return []
 
 
@@ -55,7 +58,7 @@ def extract_full_text(url: str) -> str:
             text = trafilatura.extract(downloaded)
             return text if text else ""
     except Exception as e:
-        print(f"Extraction error for {url}: {e}")
+        logger.warning(f"Extraction error for {url}: {e}")
     
     return ""
 

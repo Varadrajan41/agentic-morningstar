@@ -39,13 +39,18 @@ class MorningstarState(TypedDict):
     query: str
     rewritten_query: str  # Query after history-based reformulation
     query_intent: Optional[QueryIntent]
-    
+
+    # Query decomposition — complex queries are split into atomic sub-queries
+    # for parallel retrieval; simple queries stay as a single-element list.
+    sub_queries: List[str]
+
     # Retrieval tracking
     collections_tried: List[str]
     retrieved_docs: List[Document]
     
     # Web fallback
     web_search_performed: bool
+    web_search_count: int  # Guard against infinite loop: capped at 1
     web_results: List[SearchResult]
     
     # Evaluation

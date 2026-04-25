@@ -6,24 +6,45 @@ Features real-time agent reasoning display like Claude/ChatGPT.
 """
 import os
 import sys
+import uuid
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import sqlite3
 import streamlit as st
-from langgraph.checkpoint.memory import MemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 
 from src.graph.state import MorningstarState, QueryIntent
 from src.main import build_graph
+from src.ingestion.backup import export_knowledge_base, list_backups
+
+
+@st.cache_resource
+def get_compiled_app():
+    """Build and compile the LangGraph app once, reused across all queries.
+
+    Uses SqliteSaver so conversation memory persists across Streamlit restarts.
+    check_same_thread=False is required because Streamlit is multi-threaded.
+    """
+    workflow = build_graph()
+    conn = sqlite3.connect("./morningstar_memory.db", check_same_thread=False)
+    checkpointer = SqliteSaver(conn)
+    return workflow.compile(checkpointer=checkpointer)
 from src.tools.chroma_tools import get_chroma_manager
 from src.ingestion.web_ingestion import ingest_single_topic
 from src.ingestion.arxiv_fetcher import daily_arxiv_ingest
-from src.tools.llm_tools import generate_arxiv_query
+from src.ingestion.rss_fetcher import (
+    load_saved_feeds, save_feeds, add_feed, remove_feed,
+    preview_feed, ingest_rss_feed, ingest_all_saved_feeds,
+)
+from src.tools.llm_tools import generate_arxiv_query, synthesize_answer_stream
 from src.config import LLM_MODEL, ENABLE_SMART_WEB_INGESTION, ARXIV_MAX_RESULTS, ARXIV_MIN_SCORE
 
 # Node icons for visual feedback
 NODE_ICONS = {
     "router": "🎯",
+    "decomposer": "✂️",
     "librarian": "📚",
     "analyst": "🔍",
     "web_scout": "🌐",
@@ -34,6 +55,7 @@ NODE_ICONS = {
 
 NODE_LABELS = {
     "router": "Understanding Query",
+    "decomposer": "Decomposing Query",
     "librarian": "Searching Knowledge Base",
     "analyst": "Evaluating Results",
     "web_scout": "Searching Web",
@@ -122,53 +144,233 @@ with st.sidebar:
                 value=ARXIV_MIN_SCORE,
                 help="Only papers scoring above this will be embedded"
             )
+        sort_by_relevance = st.checkbox(
+            "Sort by relevance (not date)",
+            value=False,
+            help=(
+                "OFF (default): Fetches the 20 newest papers — best for daily ingestion of recent research.\n\n"
+                "ON: Fetches papers most relevant to your query — use this when searching for a specific paper "
+                "like 'AWQ paper' or 'BERT paper' that may be older."
+            )
+        )
     
     # Generate and preview query
+    # Cached query key: invalidated when topic or keywords change
+    topic_key = f"{research_topic}|{priority_keywords}"
+    if st.session_state.get("arxiv_query_key") != topic_key:
+        st.session_state.pop("arxiv_generated_query", None)
+
     if research_topic.strip():
-        if st.button("🔍 Preview ArXiv Query"):
+        if st.button("🔍 Generate ArXiv Query"):
             with st.spinner("Generating ArXiv query from your topic..."):
                 try:
                     generated_query = generate_arxiv_query(
                         research_topic=research_topic,
                         priority_keywords=priority_keywords
                     )
-                    st.code(generated_query, language="text")
-                    st.caption("This query will be used to search ArXiv. Click 'Fetch Papers' to proceed.")
+                    st.session_state["arxiv_generated_query"] = generated_query
+                    st.session_state["arxiv_query_key"] = topic_key
                 except Exception as e:
                     st.error(f"Error generating query: {e}")
-        
+
+        # Editable query box — always visible once generated, user can simplify before fetching
+        if "arxiv_generated_query" in st.session_state and st.session_state.get("arxiv_query_key") == topic_key:
+            edited_query = st.text_area(
+                "ArXiv Query (edit before fetching if needed):",
+                value=st.session_state["arxiv_generated_query"],
+                height=80,
+                help="Tip: If you get 0 results, simplify to fewer AND terms. E.g.: \"AWQ\" OR \"activation-aware weight quantization\""
+            )
+            # Keep edited version in sync
+            st.session_state["arxiv_generated_query"] = edited_query
+
         if st.button("📥 Fetch ArXiv Papers"):
-            with st.spinner("Generating query and fetching papers..."):
-                try:
-                    # Generate query
-                    arxiv_query = generate_arxiv_query(
-                        research_topic=research_topic,
-                        priority_keywords=priority_keywords
-                    )
-                    
-                    # Show generated query
-                    st.code(f"Query: {arxiv_query}", language="text")
-                    
-                    # Fetch papers
-                    stats = daily_arxiv_ingest(
-                        query=arxiv_query,
-                        max_results=arxiv_max_results,
-                        min_score=arxiv_min_score
-                    )
-                    
-                    if stats["embedded"] > 0:
-                        st.success(f"✅ Ingested {stats['embedded']} high-quality papers from {stats['total_fetched']} fetched!")
-                    else:
-                        st.info(f"No papers met the quality threshold (≥{arxiv_min_score}/10) from {stats['total_fetched']} fetched")
-                        st.caption("Try broadening your topic or lowering the quality threshold.")
-                        
-                except Exception as e:
-                    st.error(f"Error during ArXiv ingestion: {e}")
+            try:
+                if "arxiv_generated_query" in st.session_state and st.session_state.get("arxiv_query_key") == topic_key:
+                    arxiv_query = st.session_state["arxiv_generated_query"]
+                else:
+                    with st.spinner("Generating ArXiv query..."):
+                        arxiv_query = generate_arxiv_query(
+                            research_topic=research_topic,
+                            priority_keywords=priority_keywords
+                        )
+                st.code(f"Query: {arxiv_query}", language="text")
+
+                # Progress bar UI elements
+                progress_bar = st.progress(0, text="Fetching papers from ArXiv...")
+                status_text = st.empty()
+
+                def on_paper_progress(current, total, title, embedded):
+                    pct = current / total
+                    icon = "⭐" if embedded else "🗑️"
+                    progress_bar.progress(pct, text=f"Processing paper {current}/{total}...")
+                    status_text.caption(f"{icon} {title[:70]}...")
+
+                stats = daily_arxiv_ingest(
+                    query=arxiv_query,
+                    max_results=arxiv_max_results,
+                    min_score=arxiv_min_score,
+                    sort_by_relevance=sort_by_relevance,
+                    query_context=research_topic,
+                    progress_callback=on_paper_progress
+                )
+
+                progress_bar.progress(1.0, text="Done!")
+                status_text.empty()
+
+                if stats["embedded"] > 0:
+                    st.success(f"✅ Ingested {stats['embedded']} high-quality papers from {stats['total_fetched']} fetched!")
+                elif stats["total_fetched"] == 0:
+                    st.warning("⚠️ ArXiv returned 0 papers for this query.")
+                    st.caption("The generated query may be too specific or have invalid syntax. Try clicking 'Preview ArXiv Query' first to review it, or broaden your topic description.")
+                    # Clear cached query so next fetch generates a fresh one
+                    st.session_state.pop("arxiv_generated_query", None)
+                else:
+                    st.info(f"No papers met the quality threshold (≥{arxiv_min_score}/10) from {stats['total_fetched']} fetched")
+                    st.caption("Try broadening your topic or lowering the quality threshold.")
+
+            except Exception as e:
+                st.error(f"Error during ArXiv ingestion: {e}")
     else:
         st.info("👆 Enter a research topic above to generate an ArXiv query")
     
     st.markdown("---")
-    
+
+    # RSS Feed subscriptions
+    st.subheader("📡 RSS Feed Subscriptions")
+
+    # Initialise session flag so the feed list re-renders after add/remove
+    if "rss_feeds_version" not in st.session_state:
+        st.session_state.rss_feeds_version = 0
+
+    saved_feeds = load_saved_feeds()
+
+    # --- Add new feed ---
+    with st.expander("➕ Add New Feed", expanded=not saved_feeds):
+        new_feed_url = st.text_input(
+            "Feed URL:",
+            placeholder="https://example.com/feed.xml",
+            key="rss_new_url",
+        )
+        if new_feed_url.strip():
+            if st.button("🔍 Preview Feed"):
+                with st.spinner("Fetching feed & auto-detecting topic context…"):
+                    info = preview_feed(new_feed_url.strip(), auto_detect_context=True)
+                if "error" in info:
+                    st.error(f"Could not read feed: {info['error']}")
+                else:
+                    st.session_state["rss_preview"] = info
+                    st.success(f"**{info['title']}** — {info['entry_count']} entries")
+                    if info.get("subtitle"):
+                        st.caption(info["subtitle"])
+
+            preview = st.session_state.get("rss_preview", {})
+
+            feed_name = st.text_input(
+                "Feed name (optional):",
+                value=preview.get("title", ""),
+                key="rss_new_name",
+            )
+
+            # Show auto-detected context as the default; user can override it
+            auto_ctx = preview.get("auto_context", "")
+            if auto_ctx and auto_ctx != preview.get("title", ""):
+                st.caption(f"🤖 Auto-detected topic: **{auto_ctx}**")
+
+            feed_desc = st.text_input(
+                "Topic context for scoring:",
+                value=auto_ctx,
+                placeholder="e.g., machine learning, AI safety",
+                key="rss_new_desc",
+                help=(
+                    "Used by the LLM to score each article's relevance. "
+                    "Auto-filled from feed content — edit if needed."
+                ),
+            )
+            if st.button("✅ Subscribe"):
+                add_feed(
+                    url=new_feed_url.strip(),
+                    name=feed_name.strip() or new_feed_url.strip(),
+                    description=feed_desc.strip(),
+                )
+                st.session_state["rss_preview"] = {}
+                st.session_state.rss_feeds_version += 1
+                st.success("Subscribed!")
+                st.rerun()
+
+    # --- Saved feeds list ---
+    saved_feeds = load_saved_feeds()  # reload after possible add
+    if saved_feeds:
+        rss_max_items = st.slider(
+            "Max items per feed:", min_value=5, max_value=50, value=10, step=5, key="rss_max"
+        )
+        rss_min_score = st.slider(
+            "Quality threshold:", min_value=1, max_value=10, value=7, key="rss_score",
+            help="Only articles scoring ≥ this are embedded (RSS default is 7, slightly lower than web search 8 because feeds are already topic-curated)"
+        )
+
+        if st.button("📥 Ingest All Feeds"):
+            all_progress = st.progress(0, text="Starting...")
+            all_status = st.empty()
+            feeds_done = [0]
+            n_feeds = len(saved_feeds)
+
+            def on_all_progress(feed_url, current, total, title, embedded):
+                pct = (feeds_done[0] + current / total) / n_feeds
+                all_progress.progress(min(pct, 1.0), text=f"Feed {feeds_done[0]+1}/{n_feeds}: {title[:50]}...")
+
+            agg = ingest_all_saved_feeds(
+                max_items_per_feed=rss_max_items,
+                min_score=rss_min_score,
+                progress_callback=on_all_progress,
+            )
+            all_progress.progress(1.0, text="Done!")
+            all_status.success(
+                f"✅ All feeds done — **{agg['total_embedded']}** embedded / "
+                f"{agg['total_rejected']} rejected / {agg['total_skipped']} already known"
+            )
+
+        st.markdown("**Subscribed feeds:**")
+        for feed in saved_feeds:
+            col_info, col_ingest, col_del = st.columns([4, 1, 1])
+            with col_info:
+                st.markdown(f"**{feed['name']}**")
+                if feed.get("description"):
+                    st.caption(feed["description"])
+                st.caption(f"Added {feed.get('added_at', '?')} · {feed['url'][:50]}...")
+
+            with col_ingest:
+                if st.button("📥", key=f"rss_ingest_{feed['url']}", help="Ingest this feed"):
+                    prog = st.progress(0, text="Fetching...")
+                    stat = st.empty()
+
+                    def _cb(cur, tot, title, emb, _p=prog, _s=stat):
+                        _p.progress(cur / tot, text=f"{title[:40]}...")
+                        _s.caption(f"{'✅' if emb else '🗑️'} {title[:50]}")
+
+                    res = ingest_rss_feed(
+                        feed_url=feed["url"],
+                        max_items=rss_max_items,
+                        query_context=feed.get("description") or feed["name"],
+                        min_score=rss_min_score,
+                        progress_callback=_cb,
+                    )
+                    prog.progress(1.0, text="Done!")
+                    stat.success(
+                        f"**{res['embedded']}** embedded / {res['rejected']} rejected / "
+                        f"{res['skipped']} skipped from {res['feed_title']}"
+                    )
+
+            with col_del:
+                if st.button("🗑️", key=f"rss_del_{feed['url']}", help="Remove this feed"):
+                    remove_feed(feed["url"])
+                    st.session_state.rss_feeds_version += 1
+                    st.rerun()
+    else:
+        st.info("No feeds subscribed yet. Add a feed URL above.")
+
+    st.markdown("---")
+
     # Database stats
     st.subheader("💽 Database Stats")
     try:
@@ -182,157 +384,290 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(f"**LLM:** {LLM_MODEL}")
 
-# --- CHAT INTERFACE ---
+# --- MAIN TABS ---
+chat_tab, kb_tab = st.tabs(["💬 Chat", "🗄️ Knowledge Base"])
 
-# Initialize session state
-if "messages" not in st.session_state:
-    st.session_state.messages = []
+# --- KNOWLEDGE BASE BROWSER TAB ---
+with kb_tab:
+    st.subheader("🗄️ Knowledge Base Browser")
+    st.caption("Browse, inspect, and delete documents stored in your local knowledge base.")
 
-if "thread_id" not in st.session_state:
-    st.session_state.thread_id = "streamlit-session-1"
+    try:
+        chroma = get_chroma_manager()
+        kb_stats = chroma.get_collection_stats()
 
-# Display chat history
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-        
-        # Show reasoning if available
-        if message.get("reasoning") and show_reasoning:
-            with st.expander("🧠 Agent Reasoning"):
-                for step in message["reasoning"]:
-                    st.markdown(f"• {step}")
-        
-        # Show sources if available
-        if message.get("sources"):
-            with st.expander("📚 Sources"):
-                for src in message["sources"]:
-                    st.markdown(f"• {src}")
+        col1, col2 = st.columns(2)
+        for i, (name, count) in enumerate(kb_stats.items()):
+            (col1 if i % 2 == 0 else col2).metric(name, f"{count} docs")
 
-# Chat input
-if prompt := st.chat_input("Ask Agentic Morningstar..."):
-    # Add user message
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    
-    with st.chat_message("user"):
-        st.markdown(prompt)
-    
-    # Generate response with real-time streaming
-    with st.chat_message("assistant"):
-        # Build graph
-        workflow = build_graph()
-        checkpointer = MemorySaver()
-        app = workflow.compile(checkpointer=checkpointer)
-        
-        # Prepare state
-        initial_state: MorningstarState = {
-            "query": prompt,
-            "rewritten_query": "",
-            "query_intent": None,
-            "collections_tried": [],
-            "retrieved_docs": [],
-            "web_search_performed": False,
-            "web_results": [],
-            "confidence_score": 0.0,
-            "needs_web_fallback": enable_web_fallback,
-            "smart_ingest_enabled": smart_ingest,
-            "synthesized_answer": "",
-            "citations": [],
-            "retry_count": 0,
-            "should_retry": False,
-            "messages": [{"role": "user", "content": m["content"]} for m in st.session_state.messages],
-            "agent_reasoning": []
-        }
-        
-        # Override collections based on user selection
-        if not use_daily and not use_deep:
-            st.warning("Please select at least one collection")
-        else:
-            config = {"configurable": {"thread_id": st.session_state.thread_id}}
-            
-            # Container for real-time reasoning
-            reasoning_container = st.container()
-            
-            # Placeholder for final answer
-            answer_placeholder = st.empty()
-            
-            # Track all reasoning steps
-            all_reasoning = []
-            final_answer = ""
-            final_sources = []
-            
-            try:
-                # Stream the agent execution in real-time
-                for event in app.stream(initial_state, config=config):
-                    # Get node name and state update
-                    node_name = list(event.keys())[0]
-                    state_update = event[node_name]
-                    
-                    # Skip start/end nodes for display
-                    if node_name in ["__start__", "__end__"]:
-                        continue
-                    
-                    # Get icon and label
-                    icon = NODE_ICONS.get(node_name, "⚙️")
-                    label = NODE_LABELS.get(node_name, node_name.replace("_", " ").title())
-                    
-                    # Get new reasoning steps from this node
-                    new_reasoning = state_update.get("agent_reasoning", [])
-                    
-                    # Find reasoning that hasn't been displayed yet
-                    if new_reasoning:
-                        # Find new steps (beyond what we've already seen)
-                        displayed_count = len(all_reasoning)
-                        new_steps = new_reasoning[displayed_count:]
-                        
-                        if new_steps:
-                            # Update our tracking
-                            all_reasoning.extend(new_steps)
-                            
-                            # Display real-time status
-                            with reasoning_container:
-                                with st.status(f"{icon} {label}...", expanded=True):
-                                    for step in new_steps:
-                                        st.markdown(f"• {step}")
-                    
-                    # Check for final answer
-                    if state_update.get("synthesized_answer"):
-                        final_answer = state_update["synthesized_answer"]
-                    
-                    if state_update.get("citations"):
-                        final_sources = state_update["citations"]
-                
-                # Display final answer
-                if final_answer:
+        if st.button("🔄 Refresh KB Stats"):
+            st.rerun()
+
+        st.markdown("---")
+
+        for coll_name, collection in chroma.collections.items():
+            total = kb_stats.get(coll_name, 0)
+            st.subheader(f"📂 {coll_name}  ({total} documents)")
+
+            if total == 0:
+                st.info("No documents in this collection yet.")
+                continue
+
+            data = collection.get(include=["metadatas"])
+            ids = data["ids"]
+            metas = data["metadatas"]
+
+            # Search filter
+            search_filter = st.text_input(
+                f"Filter {coll_name}:", placeholder="Type to filter by title...",
+                key=f"filter_{coll_name}"
+            )
+
+            shown = 0
+            for doc_id, meta in zip(ids, metas):
+                title = meta.get("title", "Untitled")
+                if search_filter and search_filter.lower() not in title.lower():
+                    continue
+                shown += 1
+                score = meta.get("score", "?")
+                doc_type = meta.get("type", "unknown")
+                date = meta.get("date_ingested", "unknown")
+                url = meta.get("url", "")
+
+                with st.expander(f"{'⭐' if isinstance(score, (int,float)) and score >= 7 else '📄'} {title[:80]}  |  Score: {score}/10  |  {doc_type}"):
+                    col_a, col_b = st.columns([3, 1])
+                    with col_a:
+                        st.caption(f"**Date ingested:** {date}")
+                        if url:
+                            st.caption(f"**Source:** [{url[:60]}...]({url})" if len(url) > 60 else f"**Source:** [{url}]({url})")
+                        if meta.get("ai_summary"):
+                            st.markdown(f"**Summary:** {meta['ai_summary']}")
+                    with col_b:
+                        if st.button("🗑️ Delete", key=f"del_{doc_id}"):
+                            collection.delete(ids=[doc_id])
+                            st.success(f"Deleted: {title[:40]}...")
+                            st.rerun()
+
+            if search_filter and shown == 0:
+                st.info(f"No documents matching '{search_filter}' in {coll_name}.")
+
+            st.markdown("---")
+
+        # --- Backup / Export section ---
+        st.subheader("💾 Backup & Export")
+        col_exp, col_dl = st.columns([2, 1])
+
+        with col_exp:
+            if st.button("📤 Export Knowledge Base to JSON"):
+                with st.spinner("Exporting..."):
+                    try:
+                        stats = export_knowledge_base()
+                        st.success(
+                            f"✅ Exported **{stats['total_docs']} docs** → `{stats['path']}` "
+                            f"({stats['size_kb']} KB)"
+                        )
+                    except Exception as ex:
+                        st.error(f"Export failed: {ex}")
+
+        with col_dl:
+            backups = list_backups()
+            if backups:
+                st.caption(f"**{len(backups)} backup(s)** in `morningstar_backups/`")
+                for b in backups[:3]:  # show latest 3
+                    # Offer in-browser download of the backup JSON
+                    try:
+                        backup_bytes = open(b["path"], "rb").read()
+                        st.download_button(
+                            label=f"⬇️ {b['modified']} ({b['size_kb']} KB)",
+                            data=backup_bytes,
+                            file_name=b["name"],
+                            mime="application/json",
+                            key=f"dl_{b['name']}"
+                        )
+                    except OSError:
+                        st.caption(f"  {b['name']} ({b['size_kb']} KB)")
+            else:
+                st.caption("No backups yet.")
+
+    except Exception as e:
+        st.error(f"Could not load knowledge base: {e}")
+
+# --- CHAT INTERFACE TAB ---
+with chat_tab:
+
+    # Initialize session state
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = str(uuid.uuid4())
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+            if message.get("reasoning") and show_reasoning:
+                with st.expander("🧠 Agent Reasoning"):
+                    for step in message["reasoning"]:
+                        st.markdown(f"• {step}")
+
+            if message.get("sources"):
+                with st.expander("📚 Sources"):
+                    for src in message["sources"]:
+                        st.markdown(f"• {src}")
+
+    # Chat input
+    if prompt := st.chat_input("Ask Agentic Morningstar..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            app = get_compiled_app()
+
+            initial_state: MorningstarState = {
+                "query": prompt,
+                "rewritten_query": "",
+                "query_intent": None,
+                "sub_queries": [],
+                "collections_tried": [],
+                "retrieved_docs": [],
+                "web_search_performed": False,
+                "web_search_count": 0,
+                "web_results": [],
+                "confidence_score": 0.0,
+                "needs_web_fallback": enable_web_fallback,
+                "smart_ingest_enabled": smart_ingest,
+                "synthesized_answer": "",
+                "citations": [],
+                "retry_count": 0,
+                "should_retry": False,
+                "messages": [{"role": "user", "content": m["content"]} for m in st.session_state.messages],
+                "agent_reasoning": []
+            }
+
+            if not use_daily and not use_deep:
+                st.warning("Please select at least one collection")
+            else:
+                config = {"configurable": {"thread_id": st.session_state.thread_id}}
+                reasoning_container = st.container()
+                answer_placeholder = st.empty()
+                all_reasoning = []
+                final_answer = ""
+                final_sources = []
+                final_confidence = 0.0
+                used_web = False
+
+                # Track retrieved docs / web_results so we can stream the synthesis
+                final_retrieved_docs = []
+                final_web_results = []
+
+                try:
+                    for event in app.stream(initial_state, config=config):
+                        node_name = list(event.keys())[0]
+                        state_update = event[node_name]
+
+                        if node_name in ["__start__", "__end__"]:
+                            continue
+
+                        icon = NODE_ICONS.get(node_name, "⚙️")
+                        label = NODE_LABELS.get(node_name, node_name.replace("_", " ").title())
+                        new_reasoning = state_update.get("agent_reasoning", [])
+
+                        if new_reasoning:
+                            displayed_count = len(all_reasoning)
+                            new_steps = new_reasoning[displayed_count:]
+                            if new_steps:
+                                all_reasoning.extend(new_steps)
+                                with reasoning_container:
+                                    with st.status(f"{icon} {label}...", expanded=True):
+                                        for step in new_steps:
+                                            st.markdown(f"• {step}")
+
+                        citations_update = state_update.get("citations")
+                        if citations_update is not None:
+                            final_sources = citations_update
+                        if state_update.get("confidence_score") is not None:
+                            final_confidence = state_update["confidence_score"]
+                        if state_update.get("web_search_performed"):
+                            used_web = True
+                        # Use `is not None` so we correctly capture analyst setting
+                        # retrieved_docs=[] (empty list is falsy but meaningful).
+                        retrieved = state_update.get("retrieved_docs")
+                        if retrieved is not None:
+                            final_retrieved_docs = retrieved
+                        web = state_update.get("web_results")
+                        if web is not None:
+                            final_web_results = web
+
+                    # --- Token-level streaming synthesis ---
+                    with reasoning_container:
+                        with st.status("✍️ Writing answer...", expanded=True):
+                            st.markdown("• Synthesizing response from retrieved context")
+
+                    answer_placeholder.markdown("▌")
+                    final_answer = ""
+                    streamed_citations = []
+
+                    web_for_stream = final_web_results if final_web_results else None
+                    for chunk in synthesize_answer_stream(
+                        query=prompt,
+                        documents=final_retrieved_docs,
+                        web_results=web_for_stream
+                    ):
+                        if isinstance(chunk, dict):
+                            # Last item — citations emitted by the generator
+                            streamed_citations = chunk.get("citations", [])
+                        else:
+                            final_answer += chunk
+                            answer_placeholder.markdown(final_answer + "▌")
+
                     answer_placeholder.markdown(final_answer)
-                    
-                    # Show reasoning summary in expander
-                    if show_reasoning and all_reasoning:
-                        with st.expander("🧠 Complete Agent Reasoning Chain"):
-                            for i, step in enumerate(all_reasoning, 1):
-                                st.markdown(f"**{i}.** {step}")
-                    
-                    # Show sources
-                    if final_sources:
-                        with st.expander("📚 Sources"):
-                            for src in final_sources:
-                                st.markdown(f"• {src}")
-                    
-                    # Add to history
+                    # Prefer graph citations (richer metadata); fall back to streamed ones
+                    if not final_sources:
+                        final_sources = streamed_citations
+
+                    if final_answer:
+                        # Confidence + source indicator
+                        conf_pct = int(final_confidence * 100)
+                        source_label = "🌐 Web" if used_web else "📚 Local KB"
+                        if final_confidence >= 0.7:
+                            conf_color = "🟢"
+                        elif final_confidence >= 0.4:
+                            conf_color = "🟡"
+                        else:
+                            conf_color = "🔴"
+                        st.caption(
+                            f"{conf_color} Confidence: **{conf_pct}%** &nbsp;|&nbsp; Source: {source_label}"
+                            + (" *(low confidence triggered web fallback)*" if used_web and final_confidence < 0.6 else "")
+                        )
+                        st.progress(final_confidence)
+
+                        if show_reasoning and all_reasoning:
+                            with st.expander("🧠 Complete Agent Reasoning Chain"):
+                                for i, step in enumerate(all_reasoning, 1):
+                                    st.markdown(f"**{i}.** {step}")
+                        if final_sources:
+                            with st.expander("📚 Sources"):
+                                for src in final_sources:
+                                    st.markdown(f"• {src}")
+                        st.session_state.messages.append({
+                            "role": "assistant",
+                            "content": final_answer,
+                            "reasoning": all_reasoning if show_reasoning else [],
+                            "sources": final_sources
+                        })
+                    else:
+                        answer_placeholder.warning("No answer generated. The agent may not have found relevant information.")
+
+                except Exception as e:
+                    st.error(f"Error: {e}")
                     st.session_state.messages.append({
                         "role": "assistant",
-                        "content": final_answer,
-                        "reasoning": all_reasoning if show_reasoning else [],
-                        "sources": final_sources
+                        "content": f"Sorry, I encountered an error: {e}"
                     })
-                else:
-                    answer_placeholder.warning("No answer generated. The agent may not have found relevant information.")
-                    
-            except Exception as e:
-                st.error(f"Error: {e}")
-                st.session_state.messages.append({
-                    "role": "assistant",
-                    "content": f"Sorry, I encountered an error: {e}"
-                })
 
 # --- FOOTER ---
 st.markdown("---")

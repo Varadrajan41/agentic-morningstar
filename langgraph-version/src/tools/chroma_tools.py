@@ -8,6 +8,8 @@ import chromadb
 from rank_bm25 import BM25Okapi
 import ollama
 
+_ollama_client = ollama.Client(timeout=60)
+
 from src.config import (
     CHROMA_DB_PATH, EMBEDDING_MODEL,
     COLLECTION_DAILY, COLLECTION_DEEP,
@@ -100,7 +102,7 @@ class ChromaManager:
             raise ValueError(f"Unknown collection: {collection_name}")
         
         # Get embedding for query
-        embedding_response = ollama.embeddings(model=EMBEDDING_MODEL, prompt=query)
+        embedding_response = _ollama_client.embeddings(model=EMBEDDING_MODEL, prompt=query)
         query_embedding = embedding_response['embedding']
         
         # Vector search
@@ -155,3 +157,18 @@ def get_chroma_manager() -> ChromaManager:
     if _chroma_manager is None:
         _chroma_manager = ChromaManager()
     return _chroma_manager
+
+
+def is_already_ingested(doc_id: str) -> bool:
+    """
+    Check if a document ID already exists in any collection.
+
+    Used before scoring + embedding to avoid wasting LLM calls and
+    embedding compute on content that is already in the knowledge base.
+    """
+    chroma = get_chroma_manager()
+    for collection in chroma.collections.values():
+        result = collection.get(ids=[doc_id])
+        if result["ids"]:
+            return True
+    return False

@@ -8,7 +8,12 @@ This implements a fully agentic research assistant with:
 - Web fallback when local data is insufficient
 """
 import os
+import threading
 from typing import Literal
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+from src.utils.logger import get_logger
+logger = get_logger(__name__)
 
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
@@ -24,7 +29,9 @@ from src.tools.chroma_tools import get_chroma_manager
 from src.tools.search_tools import web_search_with_extraction
 from src.tools.llm_tools import (
     analyze_document_relevance,
+    decompose_query,
     synthesize_answer,
+    synthesize_answer_stream,
     rewrite_query_with_history,
     classify_query_intent
 )
@@ -70,60 +77,103 @@ def router_node(state: MorningstarState) -> MorningstarState:
     return state
 
 
+def decomposer_node(state: MorningstarState) -> MorningstarState:
+    """
+    Optionally split a complex multi-part query into atomic sub-queries.
+
+    Simple / factual queries pass through as a single-element list so the rest
+    of the pipeline is unaffected.  Complex COMPARISON / RESEARCH / EXPLORATION
+    queries may become 2-3 parallel sub-queries that the librarian handles in
+    separate hybrid-search calls whose results are then merged.
+    """
+    query = state.get("rewritten_query") or state["query"]
+    intent = state["query_intent"].value if state["query_intent"] else "research"
+
+    # Only attempt decomposition for multi-concept intents
+    if state["query_intent"] in [QueryIntent.COMPARISON, QueryIntent.RESEARCH, QueryIntent.EXPLORATION]:
+        sub_queries = decompose_query(query, intent)
+    else:
+        sub_queries = [query]
+
+    state["sub_queries"] = sub_queries
+
+    if len(sub_queries) > 1:
+        state["agent_reasoning"].append(
+            f"Decomposer: Split into {len(sub_queries)} sub-queries for parallel retrieval"
+        )
+        for i, sq in enumerate(sub_queries, 1):
+            display = sq[:70] + "..." if len(sq) > 70 else sq
+            state["agent_reasoning"].append(f"  Sub-query {i}: '{display}'")
+    else:
+        state["agent_reasoning"].append("Decomposer: Single-concept query — no decomposition needed")
+
+    return state
+
+
 def librarian_node(state: MorningstarState) -> MorningstarState:
     """
     Query ChromaDB collections using hybrid retrieval.
-    
-    Implements: Dense embeddings + BM25 + Reciprocal Rank Fusion
-    Mirrors the logic from Project Morningstar app.py
+
+    When the decomposer produced multiple sub-queries, each sub-query is run
+    against both collections in parallel (ThreadPoolExecutor). Results are
+    merged and deduplicated by document ID so the analyst never scores the
+    same document twice.
     """
     chroma = get_chroma_manager()
-    
-    # Use rewritten query for better retrieval
-    query = state.get("rewritten_query", state["query"])
-    
-    # Always query both collections - learned content (web) goes to deep_dive
-    # ArXiv papers go to daily_research. Intent affects ranking, not which to query.
-    collections_to_query = ["daily_research", "deep_dive_research"]
-    
-    # Note: Intent still logged for reasoning visibility
+
+    # Use sub-queries from decomposer; fall back to rewritten/original query
+    sub_queries = state.get("sub_queries") or [state.get("rewritten_query") or state["query"]]
+    collections = ["daily_research", "deep_dive_research"]
+
     intent_note = ""
     if state["query_intent"] in [QueryIntent.FACTUAL, QueryIntent.SUMMARY]:
         intent_note = " (prioritizing fast results)"
     elif state["query_intent"] == QueryIntent.RESEARCH:
         intent_note = " (deep research mode)"
-    
-    all_retrieved = []
-    
-    state["agent_reasoning"].append(f"Librarian: Querying both collections{intent_note}")
-    
-    for collection_name in collections_to_query:
-        state["agent_reasoning"].append(f"Librarian: Searching '{collection_name}'")
-        
+
+    n_searches = len(sub_queries) * len(collections)
+    state["agent_reasoning"].append(
+        f"Librarian: Running {n_searches} hybrid searches "
+        f"({len(sub_queries)} sub-quer{'y' if len(sub_queries)==1 else 'ies'} × "
+        f"{len(collections)} collections){intent_note}"
+    )
+
+    def _search(query: str, collection_name: str):
         try:
             ids, documents, metadatas = chroma.hybrid_search(
                 query=query,
                 collection_name=collection_name
             )
-            
-            # Convert to Document objects
-            for doc_id, text, meta in zip(ids, documents, metadatas):
-                doc = Document(
-                    id=doc_id,
-                    text=text,
-                    metadata=meta,
-                    score=0.0  # Will be filled by analyst
-                )
-                all_retrieved.append(doc)
-            
-            state["collections_tried"].append(collection_name)
-            
+            return [
+                Document(id=doc_id, text=text, metadata=meta, score=0.0)
+                for doc_id, text, meta in zip(ids, documents, metadatas)
+            ]
         except Exception as e:
-            state["agent_reasoning"].append(f"Librarian: Error querying {collection_name}: {e}")
-    
-    state["retrieved_docs"] = all_retrieved
-    state["agent_reasoning"].append(f"Librarian: Retrieved {len(all_retrieved)} documents total")
-    
+            state["agent_reasoning"].append(
+                f"Librarian: Error searching '{collection_name}': {e}"
+            )
+            return []
+
+    # Run all (sub_query × collection) combos in parallel
+    seen_ids: dict = {}  # id → Document; first occurrence wins
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {
+            executor.submit(_search, q, coll): (q, coll)
+            for q in sub_queries
+            for coll in collections
+        }
+        for future in as_completed(futures):
+            for doc in future.result():
+                if doc["id"] not in seen_ids:
+                    seen_ids[doc["id"]] = doc
+
+    unique_docs = list(seen_ids.values())
+    state["collections_tried"] = collections
+    state["retrieved_docs"] = unique_docs
+    state["agent_reasoning"].append(
+        f"Librarian: Retrieved {len(unique_docs)} unique documents total"
+    )
+
     return state
 
 
@@ -140,28 +190,41 @@ def analyst_node(state: MorningstarState) -> MorningstarState:
         state["agent_reasoning"].append("Analyst: No documents retrieved, confidence = 0.0")
         return state
     
-    # Score each document
-    scored_docs = []
-    total_score = 0
-    
-    for doc in state["retrieved_docs"]:
+    # Score all documents in parallel (one LLM call per doc → ThreadPoolExecutor)
+    query = state.get("rewritten_query", state["query"])
+
+    def score_doc(doc):
         analysis = analyze_document_relevance(
             title=doc["metadata"].get("title", "Untitled"),
             content=doc["text"],
-            query=state.get("rewritten_query", state["query"])
+            query=query
         )
-        
+        return doc, analysis
+
+    scored_docs = []
+    new_reasoning = []
+
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(score_doc, doc): doc for doc in state["retrieved_docs"]}
+        # Preserve original order by keying on the original doc list
+        results = {}
+        for future in as_completed(futures):
+            doc, analysis = future.result()
+            results[id(futures[future])] = (doc, analysis)
+
+    # Rebuild in original order so reasoning steps are predictable
+    for doc in state["retrieved_docs"]:
+        _, analysis = results[id(doc)]
         score = analysis.get("score", 0)
         doc["score"] = score
         doc["metadata"]["ai_summary"] = analysis.get("summary", "")
         doc["metadata"]["ai_reasoning"] = analysis.get("reasoning", "")
-        
         scored_docs.append(doc)
-        total_score += score
-        
-        state["agent_reasoning"].append(
+        new_reasoning.append(
             f"Analyst: '{doc['metadata'].get('title', 'Untitled')[:40]}...' scored {score}/10"
         )
+
+    state["agent_reasoning"].extend(new_reasoning)
     
     # Sort by score descending
     scored_docs.sort(key=lambda x: x["score"], reverse=True)
@@ -229,42 +292,37 @@ def web_scout_node(state: MorningstarState) -> MorningstarState:
         
         state["web_results"] = web_results
         state["web_search_performed"] = True
+        state["web_search_count"] = state.get("web_search_count", 0) + 1
         
         state["agent_reasoning"].append(f"Web Scout: Found {len(web_results)} web results")
         
-        # Smart Ingestion: Learn from high-quality web results
-        if ENABLE_SMART_WEB_INGESTION and web_results:
-            state["agent_reasoning"].append(
-                f"Web Scout: Smart ingestion enabled - learning from web results..."
-            )
-            
-            # Convert SearchResult back to dict for ingestion
+        # Smart Ingestion: Learn from high-quality web results in a background
+        # thread so the query response is never blocked by embedding calls.
+        if state.get("smart_ingest_enabled", ENABLE_SMART_WEB_INGESTION) and web_results:
             web_dicts = [
                 {"title": r["title"], "url": r["url"], "snippet": r["snippet"]}
                 for r in web_results
             ]
-            
-            # Run ingestion in background (don't block response)
-            # In production, this could be async or queued
-            try:
-                ingest_stats = ingest_web_results(
-                    web_results=web_dicts,
-                    query_context=query,
-                    min_score=WEB_INGEST_MIN_SCORE
-                )
-                
-                if ingest_stats["embedded"] > 0:
-                    state["agent_reasoning"].append(
-                        f"🧠 Learned: {ingest_stats['embedded']} new sources added to knowledge base!"
+
+            def _background_ingest(results, ctx_query):
+                try:
+                    ingest_web_results(
+                        web_results=results,
+                        query_context=ctx_query,
+                        min_score=WEB_INGEST_MIN_SCORE
                     )
-                else:
-                    state["agent_reasoning"].append(
-                        f"Web Scout: Web results quality too low for knowledge base (min score: {WEB_INGEST_MIN_SCORE})"
-                    )
-                    
-            except Exception as e:
-                # Don't fail the query if ingestion fails
-                state["agent_reasoning"].append(f"Web Scout: Learning skipped (error: {e})")
+                except Exception:
+                    pass  # Ingestion failures must never surface to the user
+
+            thread = threading.Thread(
+                target=_background_ingest,
+                args=(web_dicts, query),
+                daemon=True  # Dies automatically when main process exits
+            )
+            thread.start()
+            state["agent_reasoning"].append(
+                "🧠 Web Scout: Learning from web results in background..."
+            )
         
     except Exception as e:
         state["agent_reasoning"].append(f"Web Scout: Error during search: {e}")
@@ -314,26 +372,25 @@ def writer_node(state: MorningstarState) -> MorningstarState:
             for r in state["web_results"]
         ]
     
-    # Synthesize answer
-    try:
-        result = synthesize_answer(
-            query=state["query"],
-            documents=docs_for_synthesis,
-            web_results=web_for_synthesis
-        )
-        
-        state["synthesized_answer"] = result["answer"]
-        state["citations"] = result["citations"]
-        
-        source_type = "local DB + web" if web_for_synthesis else "local DB only"
-        state["agent_reasoning"].append(
-            f"Writer: Synthesized answer using {source_type} ({len(docs_for_synthesis)} docs)"
-        )
-        
-    except Exception as e:
-        state["synthesized_answer"] = f"Error generating answer: {e}"
-        state["citations"] = []
-        state["agent_reasoning"].append(f"Writer: Error during synthesis: {e}")
+    # Build citations; the actual LLM synthesis is streamed by the caller (app.py)
+    citations = []
+    for doc in docs_for_synthesis:
+        meta = doc.get("metadata", {})
+        title = meta.get("title", doc.get("id", "Unknown"))
+        score_info = f" (Score: {meta.get('score', 'N/A')}/10)" if "score" in meta else ""
+        citations.append(f"[{title}]({doc.get('id', '#')}){score_info}")
+    if web_for_synthesis:
+        for r in web_for_synthesis:
+            citations.append(f"[Web: {r.get('title', 'Unknown')}]({r.get('url', '#')})")
+
+    state["citations"] = citations
+    # Empty string signals app.py to stream the synthesis
+    state["synthesized_answer"] = ""
+
+    source_type = "local DB + web" if web_for_synthesis else "local DB only"
+    state["agent_reasoning"].append(
+        f"Writer: Ready to synthesize using {source_type} ({len(docs_for_synthesis)} docs)"
+    )
     
     return state
 
@@ -350,49 +407,51 @@ def should_retry(state: MorningstarState) -> Literal["librarian", "writer"]:
 def needs_web_search(state: MorningstarState) -> Literal["web_scout", "analyst"]:
     """
     Conditional edge: decide if web search is needed.
+
+    web_search_count acts as a hard cap (max 1) so even if web results come
+    back empty and analyst still flags needs_web_fallback, we never loop back
+    to web_scout a second time.
     """
-    # After analyst, if we need web fallback and haven't done it yet
-    if state["needs_web_fallback"] and not state["web_search_performed"]:
+    web_count = state.get("web_search_count", 0)
+    if state["needs_web_fallback"] and web_count < 1:
         return "web_scout"
-    # After web_scout, we need to go back through analysis
-    if state["web_search_performed"] and state["web_results"]:
-        return "analyst"
-    # Otherwise proceed to writer
     return "analyst"
 
 
 def build_graph() -> StateGraph:
     """
     Build the LangGraph state machine.
-    
+
     Flow:
-    START -> router -> librarian -> analyst
-                              |
-                    (if low confidence)
-                              v
-                         web_scout
-                              |
-                              v
-                    analyst (re-evaluate with web results)
-                              |
-                         [retry?] --yes--> librarian
-                              |
-                             no
-                              v
-                           writer -> END
+    START → router → decomposer → librarian → analyst
+                                                  |
+                                      (if low confidence)
+                                                  v
+                                             web_scout
+                                                  |
+                                                  v
+                                      analyst (re-evaluate with web results)
+                                                  |
+                                             [retry?] --yes--> librarian
+                                                  |
+                                                 no
+                                                  v
+                                               writer → END
     """
     workflow = StateGraph(MorningstarState)
-    
+
     # Add nodes
     workflow.add_node("router", router_node)
+    workflow.add_node("decomposer", decomposer_node)
     workflow.add_node("librarian", librarian_node)
     workflow.add_node("analyst", analyst_node)
     workflow.add_node("web_scout", web_scout_node)
     workflow.add_node("writer", writer_node)
-    
+
     # Add edges
     workflow.add_edge(START, "router")
-    workflow.add_edge("router", "librarian")
+    workflow.add_edge("router", "decomposer")
+    workflow.add_edge("decomposer", "librarian")
     workflow.add_edge("librarian", "analyst")
     
     # Conditional: web search if confidence is low
@@ -423,8 +482,7 @@ def build_graph() -> StateGraph:
 
 def main():
     """Main entry point."""
-    print("🌅 Agentic Morningstar - LangGraph Version")
-    print("=" * 50)
+    logger.info("🌅 Agentic Morningstar - LangGraph Version")
     
     # Build graph with memory checkpointing
     workflow = build_graph()
@@ -439,9 +497,11 @@ def main():
         "query": query,
         "rewritten_query": "",
         "query_intent": None,
+        "sub_queries": [],
         "collections_tried": [],
         "retrieved_docs": [],
         "web_search_performed": False,
+        "web_search_count": 0,
         "web_results": [],
         "confidence_score": 0.0,
         "needs_web_fallback": False,
@@ -454,28 +514,21 @@ def main():
         "agent_reasoning": []
     }
     
-    # Run the agent
+    # Run the agent (reasoning + retrieval nodes)
     config = {"configurable": {"thread_id": "test-1"}}
     result = app.invoke(initial_state, config=config)
-    
-    print(f"\nQuery: {query}")
-    print(f"\n{'='*50}")
-    print("Agent Reasoning Chain:")
-    print(f"{'='*50}")
+
+    logger.info(f"Query: {query}")
     for i, step in enumerate(result["agent_reasoning"], 1):
-        print(f"  {i}. {step}")
-    
-    print(f"\n{'='*50}")
-    print("Final Answer:")
-    print(f"{'='*50}")
-    print(result['synthesized_answer'])
-    
-    if result['citations']:
-        print(f"\n{'='*50}")
-        print("Sources:")
-        print(f"{'='*50}")
-        for cite in result['citations']:
-            print(f"  • {cite}")
+        logger.info(f"  {i}. {step}")
+
+    # Blocking synthesis for CLI (Streamlit uses the streaming path)
+    docs = result.get("retrieved_docs", [])
+    web = result.get("web_results") or None
+    synthesis = synthesize_answer(query=result["query"], documents=docs, web_results=web)
+    logger.info(f"Answer: {synthesis['answer']}")
+    for cite in synthesis.get('citations', []):
+        logger.info(f"  • {cite}")
 
 
 if __name__ == "__main__":

@@ -6,10 +6,15 @@ from datetime import datetime
 from typing import List, Dict, Any, Optional
 import ollama
 
+_ollama_client = ollama.Client(timeout=60)
+
 from src.config import EMBEDDING_MODEL, COLLECTION_DEEP
-from src.tools.chroma_tools import get_chroma_manager
+from src.tools.chroma_tools import get_chroma_manager, is_already_ingested
 from src.tools.llm_tools import analyze_document_relevance
 from src.tools.search_tools import extract_full_text
+from src.utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 def score_and_embed_web_content(
@@ -36,6 +41,11 @@ def score_and_embed_web_content(
     Returns:
         Dict with embedding status
     """
+    # Skip if already in knowledge base (avoids redundant LLM + embedding calls)
+    doc_id = f"web_{url.replace('/', '_').replace(':', '_')[:100]}"
+    if is_already_ingested(doc_id):
+        return {"title": title, "url": url, "score": 0, "embedded": False, "collection": None, "skipped": True}
+
     # Optionally extract full content
     content = snippet
     if extract_full:
@@ -45,7 +55,7 @@ def score_and_embed_web_content(
                 # Truncate to avoid embedding limits
                 content = full_text[:4000]
         except Exception as e:
-            print(f"⚠️ Could not extract full text from {url}: {e}")
+            logger.warning(f"⚠️ Could not extract full text from {url}: {e}")
     
     # Analyze relevance to the query context
     analysis = analyze_document_relevance(
@@ -72,7 +82,7 @@ def score_and_embed_web_content(
         doc_text = f"Title: {title}\nURL: {url}\nContent: {content}\nAI Summary: {analysis.get('summary', '')}"
         
         # Generate embedding
-        embedding_response = ollama.embeddings(
+        embedding_response = _ollama_client.embeddings(
             model=EMBEDDING_MODEL,
             prompt=doc_text
         )
@@ -80,7 +90,7 @@ def score_and_embed_web_content(
         
         # Store in deep_dive collection (web content is "deep" research)
         date_str = datetime.now().strftime("%Y-%m-%d")
-        doc_id = f"web_{url.replace('/', '_').replace(':', '_')[:100]}"
+        # doc_id already computed at top of function for deduplication check
         
         chroma.collections[COLLECTION_DEEP].upsert(
             ids=[doc_id],
@@ -100,9 +110,9 @@ def score_and_embed_web_content(
         result["embedded"] = True
         result["collection"] = COLLECTION_DEEP
         result["doc_id"] = doc_id
-        print(f"🌐 Embedded web content: {title[:60]}... (score: {score}/10)")
+        logger.info(f"🌐 Embedded web content: {title[:60]}... (score: {score}/10)")
     else:
-        print(f"🗑️ Rejected web content: {title[:60]}... (score: {score}/10)")
+        logger.debug(f"🗑️ Rejected web content: {title[:60]}... (score: {score}/10)")
     
     return result
 
@@ -126,8 +136,7 @@ def ingest_web_results(
     Returns:
         Ingestion stats
     """
-    print(f"\n🌐 Smart Web Ingestion: Learning from {len(web_results)} results")
-    print("=" * 50)
+    logger.info(f"🌐 Smart Web Ingestion: Learning from {len(web_results)} results")
     
     embedded_count = 0
     rejected_count = 0
@@ -151,14 +160,10 @@ def ingest_web_results(
                 rejected_count += 1
                 
         except Exception as e:
-            print(f"⚠️ Error ingesting web result: {e}")
+            logger.warning(f"⚠️ Error ingesting web result: {e}")
             rejected_count += 1
-    
-    print("\n" + "=" * 50)
-    print(f"✅ Web Ingestion Complete!")
-    print(f"   Processed: {len(web_results)}")
-    print(f"   Embedded to knowledge base: {embedded_count}")
-    print(f"   Rejected (low quality): {rejected_count}")
+
+    logger.info(f"✅ Web ingestion complete — processed: {len(web_results)}, embedded: {embedded_count}, rejected: {rejected_count}")
     
     return {
         "total": len(web_results),
@@ -188,8 +193,7 @@ def ingest_single_topic(
     """
     from src.tools.search_tools import web_search_with_extraction
     
-    print(f"\n📚 Learning about: {topic}")
-    print("=" * 50)
+    logger.info(f"📚 Learning about: {topic}")
     
     # Search web for topic
     web_results = web_search_with_extraction(
@@ -199,7 +203,7 @@ def ingest_single_topic(
     )
     
     if not web_results:
-        print("⚠️ No web results found")
+        logger.warning("⚠️ No web results found")
         return {"total": 0, "embedded": 0, "rejected": 0}
     
     # Ingest results

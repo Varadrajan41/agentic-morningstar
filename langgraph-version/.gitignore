@@ -14,8 +14,9 @@ venv/
 .venv/
 env/
 
-# ChromaDB
+# ChromaDB and backups
 morningstar_db/
+morningstar_backups/
 *.db
 
 # Environment
@@ -37,3 +38,9 @@ Thumbs.db
 
 # Logs
 *.log
+morningstar.log
+
+# User data (feeds, backups, memory)
+rss_feeds.json
+morningstar_backups/
+morningstar_memory.db

@@ -16,7 +16,7 @@ COLLECTION_DEEP = "deep_dive_research"
 VECTOR_K = 5
 BM25_K = 5
 FUSION_K = 60
-FINAL_TOP_K = 3
+FINAL_TOP_K = 6  # More candidates for analyst to score; analyst filters to high-quality ones
 
 # Web Search Configuration
 WEB_SEARCH_MAX_RESULTS = 5
