@@ -87,9 +87,14 @@ class ChromaManager:
         """
         Perform hybrid search: vector + BM25 + fusion.
         
+        Auto-refreshes indices before search to catch newly ingested content.
+        
         Returns:
             Tuple of (document_ids, document_texts, metadata_list)
         """
+        # Refresh indices to catch any newly ingested content
+        self._refresh_indices()
+        
         collection = self.collections.get(collection_name)
         if not collection:
             raise ValueError(f"Unknown collection: {collection_name}")

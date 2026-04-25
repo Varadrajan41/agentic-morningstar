@@ -50,30 +50,81 @@ def chat_with_ollama(
     return response['message']['content'].strip()
 
 
+def check_keyword_match(title: str, content: str, query: str) -> bool:
+    """
+    Check if query keywords appear in document title or content.
+    Returns True if keywords found, False otherwise.
+    """
+    query_lower = query.lower()
+    title_lower = title.lower()
+    content_lower = content.lower()
+    
+    # Extract key terms from query (remove common words)
+    common_words = {'what', 'is', 'are', 'the', 'a', 'an', 'in', 'of', 'for', 'to', 'how', 'why', 'when', 'where'}
+    query_terms = [term for term in query_lower.split() if term not in common_words and len(term) > 2]
+    
+    # Check if any significant query term appears in title
+    title_matches = sum(1 for term in query_terms if term in title_lower)
+    
+    # Check if query terms appear in content
+    content_matches = sum(1 for term in query_terms if term in content_lower)
+    
+    # Return True if at least one term in title, or multiple in content
+    return title_matches > 0 or content_matches >= len(query_terms) // 2
+
+
 def analyze_document_relevance(
     title: str,
     content: str,
     query: str
 ) -> Dict[str, Any]:
     """
-    Analyze document relevance to a query.
-    Returns score 1-10 and reasoning.
+    Analyze document relevance to a query with strict title-focused scoring.
     
-    This mirrors the scoring from digest_generator.py and web_Scout.py
+    The TITLE is the primary indicator - if it doesn't show the document
+    is primarily about the query topic, the score should be LOW even if
+    the query is mentioned in passing in the content.
+    
+    Returns score 1-10 and reasoning.
     """
+    # First check: keyword validation
+    has_keyword_match = check_keyword_match(title, content, query)
+    
     system_prompt = """
     You are a strict Data Scientist evaluating research relevance.
     
+    CRITICAL SCORING RULES:
+    1. The TITLE is the PRIMARY indicator of what a document is about
+    2. If the TITLE is about a DIFFERENT concept than the query, score LOW (1-3)
+    3. A query topic mentioned only in passing in content is NOT relevant
+    4. Documents must be PRIMARILY about the query topic to score 8-10
+    5. Never give high scores to documents with mismatched topics
+    
     SCORING RUBRIC:
-    - 1-3: Completely unrelated (e.g., color theory, physics, biology)
-    - 4-7: General AI/ML, but not specifically relevant
-    - 8-10: Highly relevant to query topic
+    - 1-3: Mismatched topic (title about different concept, or tangential mention only)
+      * Examples: Query "RAG" → Title "Agent Harness" (different concepts)
+      * Examples: Query "transformers" → Title "CNNs" (wrong architecture)
+    - 4-5: Related domain but different focus
+      * Examples: Query "RAG" → Title "LLMs" (same field, not specific topic)
+      * Examples: Query "cybersecurity" → Title "AI safety" (related but not query)
+    - 6-7: Partially relevant, mentions query but not primary focus
+    - 8-10: Directly about the query topic (title clearly indicates this)
+      * Examples: Query "RAG" → Title "What is RAG in LLMs"
+      * Examples: Query "transformers" → Title "BERT: Pre-training Transformers"
+    
+    EXPLICIT EXAMPLES:
+    - Query: "RAG" → Doc: "Agent Harness Engineering" → Score: 2/10 (wrong topic, title not about RAG)
+    - Query: "RAG" → Doc: "Introduction to Python" → Score: 1/10 (completely unrelated)
+    - Query: "RAG" → Doc: "What is RAG and How It Works" → Score: 10/10 (direct match)
+    - Query: "transformers" → Doc: "CNNs for Image Classification" → Score: 1/10 (wrong architecture)
+    - Query: "transformers" → Doc: "BERT Architecture" → Score: 9/10 (directly about transformers)
+    - Query: "multi-agent" → Doc: "Single LLM Performance" → Score: 3/10 (different concept)
     
     Output valid JSON with these exact keys:
     {
-      "reasoning": "Explain your thought process in 1 sentence",
+      "reasoning": "Explain title match and why score was assigned",
       "score": <integer 1-10>,
-      "summary": "2-sentence summary of key points"
+      "summary": "2-sentence summary of what the document is actually about"
     }
     """
     
@@ -81,9 +132,14 @@ def analyze_document_relevance(
 Query: {query}
 
 Document Title: {title}
-Document Content: {content[:2000]}
 
-Evaluate relevance and return JSON.
+Document Content (truncated):
+{content[:2000]}
+
+INSTRUCTION: Does the TITLE indicate this document is primarily ABOUT "{query}"?
+If the title is clearly about a different concept, give a LOW score (1-3) even if the content mentions the query.
+
+Return JSON.
 """
     
     try:
@@ -93,7 +149,23 @@ Evaluate relevance and return JSON.
             json_mode=True,
             temperature=0.1
         )
-        return json.loads(response)
+        result = json.loads(response)
+        
+        # Post-processing: validate with keyword check
+        score = result.get("score", 0)
+        
+        # If no keyword match and score is high, reduce it
+        if not has_keyword_match and score >= 7:
+            result["score"] = min(score, 4)  # Cap at 4 if no keyword match
+            result["reasoning"] = f"[AUTO-CORRECTED] {result.get('reasoning', '')} - Score reduced: query keywords not found in document."
+        
+        # If score is suspiciously high but no keyword match in title, flag it
+        if score >= 8 and not check_keyword_match(title, "", query):
+            result["score"] = 3  # Force low score
+            result["reasoning"] = f"[AUTO-CORRECTED] Title mismatch: Document appears to be about different topic than query."
+        
+        return result
+        
     except json.JSONDecodeError:
         return {
             "reasoning": "Error parsing response",
@@ -251,3 +323,81 @@ def classify_query_intent(query: str) -> str:
             return valid
     
     return 'research'  # Default
+
+
+def generate_arxiv_query(research_topic: str, priority_keywords: str = "") -> str:
+    """
+    Convert natural language research topic to proper ArXiv query syntax.
+    
+    Uses LLM to understand the topic and generate appropriate ArXiv query
+    with correct categories, boolean operators, and synonym expansion.
+    
+    Args:
+        research_topic: Natural language description of research interest
+        priority_keywords: Optional comma-separated keywords to prioritize
+        
+    Returns:
+        Properly formatted ArXiv query string
+    """
+    system_prompt = """
+    You are an expert at converting research interests into ArXiv search queries.
+    
+    ArXiv Query Syntax Rules:
+    - cat:cs.AI = Artificial Intelligence papers
+    - cat:cs.CR = Cryptography and Security
+    - cat:cs.LG = Machine Learning
+    - cat:cs.CL = Computation and Language (NLP)
+    - cat:cs.IR = Information Retrieval
+    - cat:cs.DB = Databases
+    - cat:cs.SE = Software Engineering
+    - Use AND to require all terms
+    - Use OR for synonyms/alternatives  
+    - Use quotes for multi-word phrases
+    - Use parentheses for grouping
+    - all: searches all fields
+    - ti: searches title only
+    - au: searches author
+    
+    Example conversions:
+    - "transformers in healthcare" → cat:cs.AI AND (transformer OR "attention mechanism" OR "transformer model") AND (healthcare OR medical OR clinical OR "health care")
+    - "multi-agent RAG systems" → cat:cs.AI AND ("multi-agent" OR "multiagent" OR "agent framework") AND (RAG OR "retrieval augmented" OR "retrieval-augmented")
+    - "LLM security vulnerabilities" → cat:cs.AI AND cat:cs.CR AND (LLM OR "large language model" OR "language model") AND (security OR vulnerability OR attack OR "adversarial")
+    - "vector database performance" → cat:cs.DB AND cat:cs.IR AND ("vector database" OR "vector store" OR "vector index") AND (performance OR scalability OR optimization)
+    
+    Always include the most relevant cs category first.
+    Expand keywords with synonyms and related terms.
+    """
+    
+    keyword_instruction = ""
+    if priority_keywords.strip():
+        keyword_instruction = f"\n\nPriority keywords to include (give these preference): {priority_keywords}"
+    
+    user_prompt = f"""Research interest: {research_topic}{keyword_instruction}
+
+Generate an ArXiv query that:
+1. Selects the most relevant cs categories (cat:cs.X)
+2. Captures all key research concepts from the topic
+3. Includes synonyms and related technical terms
+4. Uses proper ArXiv boolean syntax (AND, OR, parentheses)
+5. Wraps multi-word phrases in double quotes
+
+Return ONLY the query string, nothing else. No explanation."""
+    
+    query = chat_with_ollama(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        temperature=0.3
+    )
+    
+    # Clean up the query - remove any markdown or extra text
+    query = query.strip()
+    if query.startswith('```') and query.endswith('```'):
+        query = query[3:-3].strip()
+    if query.startswith('`') and query.endswith('`'):
+        query = query[1:-1].strip()
+    
+    # Ensure it has a category if missing
+    if not query.startswith('cat:') and not query.startswith('all:'):
+        query = f"cat:cs.AI AND ({query})"
+    
+    return query

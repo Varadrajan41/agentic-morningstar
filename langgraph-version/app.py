@@ -18,7 +18,8 @@ from src.main import build_graph
 from src.tools.chroma_tools import get_chroma_manager
 from src.ingestion.web_ingestion import ingest_single_topic
 from src.ingestion.arxiv_fetcher import daily_arxiv_ingest
-from src.config import LLM_MODEL, ENABLE_SMART_WEB_INGESTION
+from src.tools.llm_tools import generate_arxiv_query
+from src.config import LLM_MODEL, ENABLE_SMART_WEB_INGESTION, ARXIV_MAX_RESULTS, ARXIV_MIN_SCORE
 
 # Node icons for visual feedback
 NODE_ICONS = {
@@ -85,17 +86,86 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Error during learning: {e}")
     
-    # ArXiv ingestion
-    if st.button("📚 Run ArXiv Ingestion"):
-        with st.spinner("Fetching and analyzing ArXiv papers..."):
-            try:
-                stats = daily_arxiv_ingest()
-                if stats["embedded"] > 0:
-                    st.success(f"✅ Ingested {stats['embedded']} high-quality papers!")
-                else:
-                    st.info("No new papers met the quality threshold")
-            except Exception as e:
-                st.error(f"Error during ArXiv ingestion: {e}")
+    # ArXiv ingestion with natural language query generation
+    st.markdown("**📚 ArXiv Paper Ingestion**")
+    
+    # Natural language topic input
+    research_topic = st.text_input(
+        "What topic are you researching?",
+        placeholder="e.g., multi-agent RAG systems for healthcare, transformer models for medical diagnosis",
+        help="Describe your research interest in plain English. The AI will convert it to an ArXiv query."
+    )
+    
+    # Optional priority keywords
+    priority_keywords = st.text_input(
+        "Priority keywords (optional):",
+        placeholder="e.g., LangGraph, retrieval, clinical",
+        help="Comma-separated keywords that should be given preference in the search"
+    )
+    
+    # Advanced options
+    with st.expander("Advanced Options"):
+        col1, col2 = st.columns(2)
+        with col1:
+            arxiv_max_results = st.slider(
+                "Max papers:",
+                min_value=5,
+                max_value=50,
+                value=ARXIV_MAX_RESULTS,
+                step=5
+            )
+        with col2:
+            arxiv_min_score = st.slider(
+                "Quality threshold:",
+                min_value=1,
+                max_value=10,
+                value=ARXIV_MIN_SCORE,
+                help="Only papers scoring above this will be embedded"
+            )
+    
+    # Generate and preview query
+    if research_topic.strip():
+        if st.button("🔍 Preview ArXiv Query"):
+            with st.spinner("Generating ArXiv query from your topic..."):
+                try:
+                    generated_query = generate_arxiv_query(
+                        research_topic=research_topic,
+                        priority_keywords=priority_keywords
+                    )
+                    st.code(generated_query, language="text")
+                    st.caption("This query will be used to search ArXiv. Click 'Fetch Papers' to proceed.")
+                except Exception as e:
+                    st.error(f"Error generating query: {e}")
+        
+        if st.button("📥 Fetch ArXiv Papers"):
+            with st.spinner("Generating query and fetching papers..."):
+                try:
+                    # Generate query
+                    arxiv_query = generate_arxiv_query(
+                        research_topic=research_topic,
+                        priority_keywords=priority_keywords
+                    )
+                    
+                    # Show generated query
+                    st.code(f"Query: {arxiv_query}", language="text")
+                    
+                    # Fetch papers
+                    stats = daily_arxiv_ingest(
+                        query=arxiv_query,
+                        max_results=arxiv_max_results,
+                        min_score=arxiv_min_score
+                    )
+                    
+                    if stats["embedded"] > 0:
+                        st.success(f"✅ Ingested {stats['embedded']} high-quality papers from {stats['total_fetched']} fetched!")
+                    else:
+                        st.info(f"No papers met the quality threshold (≥{arxiv_min_score}/10) from {stats['total_fetched']} fetched")
+                        st.caption("Try broadening your topic or lowering the quality threshold.")
+                        
+                except Exception as e:
+                    st.error(f"Error during ArXiv ingestion: {e}")
+    else:
+        st.info("👆 Enter a research topic above to generate an ArXiv query")
     
     st.markdown("---")
     

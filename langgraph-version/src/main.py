@@ -82,23 +82,23 @@ def librarian_node(state: MorningstarState) -> MorningstarState:
     # Use rewritten query for better retrieval
     query = state.get("rewritten_query", state["query"])
     
-    # Determine which collections to query based on intent
-    collections_to_query = []
+    # Always query both collections - learned content (web) goes to deep_dive
+    # ArXiv papers go to daily_research. Intent affects ranking, not which to query.
+    collections_to_query = ["daily_research", "deep_dive_research"]
     
+    # Note: Intent still logged for reasoning visibility
+    intent_note = ""
     if state["query_intent"] in [QueryIntent.FACTUAL, QueryIntent.SUMMARY]:
-        # Fast cards for quick facts
-        collections_to_query = ["daily_research"]
+        intent_note = " (prioritizing fast results)"
     elif state["query_intent"] == QueryIntent.RESEARCH:
-        # Deep dive for research queries
-        collections_to_query = ["daily_research", "deep_dive_research"]
-    else:
-        # Query both for exploration/comparison
-        collections_to_query = ["daily_research", "deep_dive_research"]
+        intent_note = " (deep research mode)"
     
     all_retrieved = []
     
+    state["agent_reasoning"].append(f"Librarian: Querying both collections{intent_note}")
+    
     for collection_name in collections_to_query:
-        state["agent_reasoning"].append(f"Librarian: Querying '{collection_name}' collection")
+        state["agent_reasoning"].append(f"Librarian: Searching '{collection_name}'")
         
         try:
             ids, documents, metadatas = chroma.hybrid_search(
