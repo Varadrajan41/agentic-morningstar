@@ -1,0 +1,45 @@
+name: Daily Knowledge Ingestion
+
+on:
+  schedule:
+    # Run daily at 6 AM UTC
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    # Allow manual trigger from GitHub UI
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+      
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        
+    - name: Install dependencies
+      run: |
+        pip install -r langgraph-version/requirements.txt
+        
+    - name: Run ArXiv Ingestion
+      working-directory: langgraph-version
+      env:
+        LLM_MODEL: ${{ secrets.LLM_MODEL || 'qwen2.5:7b-instruct' }}
+        EMBEDDING_MODEL: ${{ secrets.EMBEDDING_MODEL || 'nomic-embed-text' }}
+        CHROMA_DB_PATH: ./morningstar_db
+        ARXIV_QUERY: "cat:cs.AI OR cat:cs.CR"
+        ARXIV_MAX_RESULTS: "20"
+        ARXIV_MIN_SCORE: "7"
+      run: |
+        python -m src.ingestion.arxiv_fetcher
+        
+    - name: Commit and push if changes
+      run: |
+        git config --local user.email "github-actions[bot]@users.noreply.github.com"
+        git config --local user.name "github-actions[bot]"
+        git add langgraph-version/morningstar_db/
+        git diff --quiet && git diff --staged --quiet || (git commit -m "Daily ArXiv ingestion - $(date +%Y-%m-%d)" && git push)
+      continue-on-error: true

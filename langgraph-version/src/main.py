@@ -17,7 +17,8 @@ from src.graph.state import MorningstarState, QueryIntent, Document, SearchResul
 from src.config import (
     LLM_MODEL, EMBEDDING_MODEL,
     COLLECTION_DAILY, COLLECTION_DEEP,
-    CONFIDENCE_THRESHOLD, MAX_RETRIES
+    CONFIDENCE_THRESHOLD, MAX_RETRIES,
+    ENABLE_SMART_WEB_INGESTION, WEB_INGEST_MIN_SCORE
 )
 from src.tools.chroma_tools import get_chroma_manager
 from src.tools.search_tools import web_search_with_extraction
@@ -27,6 +28,7 @@ from src.tools.llm_tools import (
     rewrite_query_with_history,
     classify_query_intent
 )
+from src.ingestion.web_ingestion import ingest_web_results
 
 
 def router_node(state: MorningstarState) -> MorningstarState:
@@ -197,8 +199,10 @@ def web_scout_node(state: MorningstarState) -> MorningstarState:
     Perform web search when local data is insufficient.
     
     Uses DuckDuckGo for privacy-preserving search.
-    Optionally extracts full text with trafilatura.
     Mirrors web_Scout.py logic.
+    
+    If smart ingestion is enabled, high-quality web results are
+    automatically added to the knowledge base for future queries.
     """
     query = state.get("rewritten_query", state["query"])
     
@@ -227,6 +231,40 @@ def web_scout_node(state: MorningstarState) -> MorningstarState:
         state["web_search_performed"] = True
         
         state["agent_reasoning"].append(f"Web Scout: Found {len(web_results)} web results")
+        
+        # Smart Ingestion: Learn from high-quality web results
+        if ENABLE_SMART_WEB_INGESTION and web_results:
+            state["agent_reasoning"].append(
+                f"Web Scout: Smart ingestion enabled - learning from web results..."
+            )
+            
+            # Convert SearchResult back to dict for ingestion
+            web_dicts = [
+                {"title": r["title"], "url": r["url"], "snippet": r["snippet"]}
+                for r in web_results
+            ]
+            
+            # Run ingestion in background (don't block response)
+            # In production, this could be async or queued
+            try:
+                ingest_stats = ingest_web_results(
+                    web_results=web_dicts,
+                    query_context=query,
+                    min_score=WEB_INGEST_MIN_SCORE
+                )
+                
+                if ingest_stats["embedded"] > 0:
+                    state["agent_reasoning"].append(
+                        f"🧠 Learned: {ingest_stats['embedded']} new sources added to knowledge base!"
+                    )
+                else:
+                    state["agent_reasoning"].append(
+                        f"Web Scout: Web results quality too low for knowledge base (min score: {WEB_INGEST_MIN_SCORE})"
+                    )
+                    
+            except Exception as e:
+                # Don't fail the query if ingestion fails
+                state["agent_reasoning"].append(f"Web Scout: Learning skipped (error: {e})")
         
     except Exception as e:
         state["agent_reasoning"].append(f"Web Scout: Error during search: {e}")
@@ -411,6 +449,7 @@ def main():
         "citations": [],
         "retry_count": 0,
         "should_retry": False,
+        "smart_ingest_enabled": True,
         "messages": [{"role": "user", "content": query}],
         "agent_reasoning": []
     }

@@ -52,6 +52,9 @@ class MorningstarState(TypedDict):
     confidence_score: float
     needs_web_fallback: bool
     
+    # Smart ingestion
+    smart_ingest_enabled: bool  # Whether to auto-learn from web results
+    
     # Synthesis
     synthesized_answer: str
     citations: List[str]

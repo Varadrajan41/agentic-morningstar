@@ -16,7 +16,9 @@ from langgraph.checkpoint.memory import MemorySaver
 from src.graph.state import MorningstarState, QueryIntent
 from src.main import build_graph
 from src.tools.chroma_tools import get_chroma_manager
-from src.config import LLM_MODEL
+from src.ingestion.web_ingestion import ingest_single_topic
+from src.ingestion.arxiv_fetcher import daily_arxiv_ingest
+from src.config import LLM_MODEL, ENABLE_SMART_WEB_INGESTION
 
 # Node icons for visual feedback
 NODE_ICONS = {
@@ -59,6 +61,41 @@ with st.sidebar:
     st.subheader("Agent Settings")
     show_reasoning = st.checkbox("Show Agent Reasoning", value=True)
     enable_web_fallback = st.checkbox("Enable Web Fallback", value=True)
+    smart_ingest = st.checkbox(
+        "🧠 Smart Web Learning", 
+        value=ENABLE_SMART_WEB_INGESTION,
+        help="Automatically add high-quality web results to knowledge base"
+    )
+    
+    st.markdown("---")
+    
+    # Knowledge Ingestion
+    st.subheader("📥 Knowledge Ingestion")
+    
+    # Manual topic learning
+    learn_topic = st.text_input("Learn about topic:", placeholder="Enter topic to research...")
+    if st.button("🎓 Learn Now", disabled=not learn_topic):
+        with st.spinner(f"Learning about: {learn_topic}..."):
+            try:
+                stats = ingest_single_topic(learn_topic)
+                if stats["embedded"] > 0:
+                    st.success(f"✅ Learned {stats['embedded']} new sources about '{learn_topic}'!")
+                else:
+                    st.info(f"No high-quality sources found for '{learn_topic}'")
+            except Exception as e:
+                st.error(f"Error during learning: {e}")
+    
+    # ArXiv ingestion
+    if st.button("📚 Run ArXiv Ingestion"):
+        with st.spinner("Fetching and analyzing ArXiv papers..."):
+            try:
+                stats = daily_arxiv_ingest()
+                if stats["embedded"] > 0:
+                    st.success(f"✅ Ingested {stats['embedded']} high-quality papers!")
+                else:
+                    st.info("No new papers met the quality threshold")
+            except Exception as e:
+                st.error(f"Error during ArXiv ingestion: {e}")
     
     st.markdown("---")
     
@@ -127,6 +164,7 @@ if prompt := st.chat_input("Ask Agentic Morningstar..."):
             "web_results": [],
             "confidence_score": 0.0,
             "needs_web_fallback": enable_web_fallback,
+            "smart_ingest_enabled": smart_ingest,
             "synthesized_answer": "",
             "citations": [],
             "retry_count": 0,
