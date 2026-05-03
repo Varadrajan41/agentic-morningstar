@@ -2,6 +2,7 @@
 LLM interaction tools using Ollama.
 """
 import json
+from datetime import datetime
 from typing import Dict, Any, List, Optional
 import ollama
 
@@ -79,6 +80,57 @@ def check_keyword_match(title: str, content: str, query: str) -> bool:
     return title_matches > 0 or content_matches >= len(query_terms) // 2
 
 
+def rewrite_query_for_web(query: str) -> str:
+    """
+    Rewrite a conversational query into a short, keyword-dense DuckDuckGo search string.
+
+    This is intentionally separate from rewrite_query_with_history:
+    - rewrite_query_with_history → optimised for KB vector/BM25 retrieval (full sentence OK)
+    - rewrite_query_for_web      → optimised for DuckDuckGo (≤5 words, keywords only)
+
+    Args:
+        query: Conversational or rewritten query from the router.
+
+    Returns:
+        Short keyword string (≤5 words). Falls back to original query on error.
+    """
+    system_prompt = """You are a web search query optimizer for DuckDuckGo.
+
+Convert the user's question into a SHORT, keyword-dense search query.
+
+STRICT RULES:
+- Maximum 5 words — fewer is better
+- Keep only essential nouns, proper nouns, and specific technical terms
+- Strip ALL filler words: "tell me about", "what is", "how does", "explain", "any", "some", "the", "a", "latest", "please", "can you", etc.
+- If the question asks for a GitHub repo / implementation / code, include "github" in the output
+- Preserve acronyms and product/tool names EXACTLY (RAG, vLLM, TurboQuant, SGLang, AWQ, etc.)
+- Return ONLY the search query — no explanation, no punctuation at the end, no quotes
+
+EXAMPLES:
+"Tell me about any github repo which implements turboquant" → turboquant github implementation
+"What are the latest advances in Agentic RAG?" → agentic RAG advances
+"How does vLLM handle continuous batching?" → vLLM continuous batching
+"What is retrieval augmented generation?" → retrieval augmented generation
+"Compare SGLang vs vLLM for LLM inference" → SGLang vs vLLM inference
+"Explain AWQ activation-aware weight quantization paper" → AWQ weight quantization paper
+"Which companies use LangGraph in production?" → LangGraph production use cases"""
+
+    user_prompt = f"Query: {query}\nSearch query:"
+
+    try:
+        result = chat_with_ollama(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            temperature=0.1
+        ).strip().strip('"').strip("'").rstrip(".")
+        # Safety: if LLM returns something unusably long or empty, use original
+        if not result or len(result.split()) > 10:
+            return query
+        return result
+    except Exception:
+        return query
+
+
 def generate_feed_context(feed_title: str, entry_titles: List[str]) -> str:
     """
     Auto-detect the scoring context for an RSS feed by asking the LLM to
@@ -114,58 +166,95 @@ def generate_feed_context(feed_title: str, entry_titles: List[str]) -> str:
         return feed_title
 
 
-def decompose_query(query: str, intent: str) -> List[str]:
+def decompose_query(query: str, intent: str) -> Dict[str, Any]:
     """
-    Split a complex multi-part query into 2-3 atomic sub-queries for parallel retrieval.
+    Analyze query structure in a single LLM call: decompose into sub-queries AND
+    extract keywords / primary terms that are reused across the whole pipeline.
 
-    Simple or single-concept queries are returned unchanged as a one-element list.
-    Decomposition is only attempted for COMPARISON, RESEARCH, and EXPLORATION intents.
+    This replaces the previous List[str] return. Callers should access:
+        result["sub_queries"]    — 1-3 atomic retrieval queries
+        result["keywords"]       — all significant search terms (no filler)
+        result["primary_terms"]  — core must-match terms (subset of keywords);
+                                   docs that don't mention any of these are
+                                   almost certainly irrelevant.
 
     Args:
-        query: The (possibly rewritten) user query.
+        query:  The (possibly rewritten) user query.
         intent: Query intent string ('comparison', 'research', 'exploration', etc.)
 
     Returns:
-        List of 1-3 sub-query strings. Always has at least one element.
+        Dict with sub_queries, keywords, primary_terms.
+        Always safe to call: falls back to safe defaults on any error.
     """
-    system_prompt = """You are a query decomposition specialist for a research retrieval system.
+    system_prompt = """You are a query analysis specialist for a research retrieval system.
 
-Analyze the user query and decide if it contains MULTIPLE distinct information needs.
+For the given query perform THREE tasks simultaneously:
 
-DECOMPOSE if the query:
-- Compares or contrasts two or more concepts
-- Asks about different aspects of different topics in one sentence
-- Uses connectors like "and also", "as well as", "vs", "versus", "compared to",
-  "plus", "additionally", "both ... and"
+1. DECOMPOSE into sub-queries
+   - Decompose if: comparing/contrasting concepts, multiple distinct topics in one sentence,
+     connectors like "vs", "versus", "compared to", "and also", "both … and"
+   - Do NOT decompose: single concept (even if elaborate), simple factual/definition question
+   - Maximum 3 sub-queries; prefer 1 when in doubt
 
-DO NOT decompose if the query:
-- Asks about a single concept (even if phrased elaborately)
-- Is already focused on one topic
-- Is a simple factual or definition question
+2. EXTRACT KEYWORDS
+   - keywords: ALL important nouns, acronyms, product/tool names, and technical terms
+               Strip all filler: "what", "is", "are", "how", "the", "a", "an",
+               "tell me", "explain", "latest", "recent", "any", "some", "about"
+   - primary_terms: the CORE concept(s) the user MUST find info about
+               * If a document doesn't mention any primary_term it is irrelevant
+               * Specific product names, acronyms, and proper nouns are ALWAYS primary
+               * Usually 1-2 terms; never more than 3
 
-CRITICAL RULES:
-- Maximum 3 sub-queries — never more
-- Each sub-query must be fully self-contained and independently searchable
-- Sub-queries should collectively cover the original query without overlap
-- Prefer 2 sub-queries over 3 unless there are clearly 3 distinct aspects
-- Return ONLY valid JSON with no markdown fences
+3. DETECT TIME-SENSITIVITY
+   - is_time_sensitive: true if the query asks for LIVE, CURRENT, or VERY RECENT data
+     Examples of time-sensitive signals: "current", "today", "now", "live", "latest news",
+     "standing", "standings", "score", "scores", "price", "stock", "weather",
+     "breaking", "this week", "this month", specific recent years (2024, 2025, 2026)
+   - is_time_sensitive: false for conceptual/technical/historical knowledge
+     Examples: "what is RAG", "how does vLLM work", "explain transformers",
+     "compare SGLang vs vLLM", "history of neural networks"
+   - Note: "latest papers" or "recent research" = false (academic context, not live data)
+
+RULES:
+- primary_terms must be a strict subset of keywords
+- Return ONLY valid JSON — no markdown fences, no extra text
 
 EXAMPLES:
+Query: "Tell me about any github repo which implements turboquant"
+→ {"sub_queries": ["turboquant github implementation"], "keywords": ["turboquant", "github", "implementation"], "primary_terms": ["turboquant"], "is_time_sensitive": false}
+
 Query: "Compare RAG vs Agentic RAG and list healthcare use cases"
-→ {"sub_queries": ["What is RAG and how does retrieval augmented generation work?", "What is Agentic RAG and how does it differ from traditional RAG?", "Healthcare use cases for RAG systems"]}
+→ {"sub_queries": ["What is RAG and how does retrieval augmented generation work?", "What is Agentic RAG vs traditional RAG?", "Healthcare use cases for RAG systems"], "keywords": ["RAG", "agentic RAG", "retrieval augmented generation", "healthcare"], "primary_terms": ["RAG", "agentic RAG"], "is_time_sensitive": false}
+
+Query: "What is the current IPL standings?"
+→ {"sub_queries": ["IPL standings current"], "keywords": ["IPL", "standings", "current"], "primary_terms": ["IPL", "standings"], "is_time_sensitive": true}
+
+Query: "What is the price of NVIDIA stock today?"
+→ {"sub_queries": ["NVIDIA stock price today"], "keywords": ["NVIDIA", "stock", "price"], "primary_terms": ["NVIDIA", "stock"], "is_time_sensitive": true}
+
+Query: "What are the latest advances in Agentic RAG?"
+→ {"sub_queries": ["latest advances agentic RAG"], "keywords": ["agentic RAG", "advances"], "primary_terms": ["agentic RAG"], "is_time_sensitive": false}
 
 Query: "Explain quantization techniques for LLMs"
-→ {"sub_queries": ["Explain quantization techniques for LLMs"]}
-
-Query: "What are the advantages of vLLM and how does SGLang compare to it?"
-→ {"sub_queries": ["What are the advantages of vLLM for LLM inference?", "How does SGLang compare to vLLM?"]}
-"""
+→ {"sub_queries": ["Explain quantization techniques for LLMs"], "keywords": ["quantization", "LLMs", "techniques"], "primary_terms": ["quantization", "LLMs"], "is_time_sensitive": false}"""
 
     user_prompt = f"""Query: {query}
 Intent: {intent}
 
-Return JSON: {{"sub_queries": ["sub_query_1", ...]}}
-If no decomposition is needed: {{"sub_queries": ["{query}"]}}"""
+Return JSON:
+{{
+  "sub_queries": ["..."],
+  "keywords": ["term1", "term2"],
+  "primary_terms": ["core1"],
+  "is_time_sensitive": false
+}}"""
+
+    _fallback: Dict[str, Any] = {
+        "sub_queries": [query],
+        "keywords": [],
+        "primary_terms": [],
+        "is_time_sensitive": False
+    }
 
     try:
         response = chat_with_ollama(
@@ -175,14 +264,32 @@ If no decomposition is needed: {{"sub_queries": ["{query}"]}}"""
             temperature=0.1
         )
         data = json.loads(response)
+
         sub_queries = data.get("sub_queries", [])
         if not isinstance(sub_queries, list) or not sub_queries:
-            return [query]
-        # Sanitise: non-empty strings only, cap at 3
-        clean = [str(q).strip() for q in sub_queries if str(q).strip()]
-        return clean[:3] if clean else [query]
+            sub_queries = [query]
+        sub_queries = [str(q).strip() for q in sub_queries if str(q).strip()][:3] or [query]
+
+        keywords = data.get("keywords", [])
+        if not isinstance(keywords, list):
+            keywords = []
+        keywords = [str(k).strip().lower() for k in keywords if str(k).strip()]
+
+        primary_terms = data.get("primary_terms", [])
+        if not isinstance(primary_terms, list):
+            primary_terms = []
+        primary_terms = [str(t).strip().lower() for t in primary_terms if str(t).strip()]
+
+        is_time_sensitive = bool(data.get("is_time_sensitive", False))
+
+        return {
+            "sub_queries": sub_queries,
+            "keywords": keywords,
+            "primary_terms": primary_terms,
+            "is_time_sensitive": is_time_sensitive
+        }
     except Exception:
-        return [query]
+        return _fallback
 
 
 def analyze_document_relevance(
@@ -289,11 +396,18 @@ Return JSON.
 def _build_synthesis_prompts(
     query: str,
     documents: list,
-    web_results: Optional[list] = None
+    web_results: Optional[list] = None,
+    is_time_sensitive: bool = False
 ) -> tuple:
     """
     Build system prompt, user prompt, and citations for synthesis.
     Shared by both the blocking and streaming synthesis functions.
+
+    Args:
+        is_time_sensitive: When True, the LLM is told to prioritise web results
+                           over its training knowledge (live scores, prices, etc.).
+                           When False, training knowledge is used freely alongside
+                           the provided context.
 
     Returns:
         (system_prompt, user_prompt, citations)
@@ -319,12 +433,31 @@ def _build_synthesis_prompts(
         for r in web_results:
             citations.append(f"[Web: {r.get('title', 'Unknown')}]({r.get('url', '#')})")
 
-    system_prompt = """
-    You are Project Morningstar, a research assistant.
-    Synthesize a clear, accurate answer using the provided context.
-    Always cite your sources naturally in the text.
-    If the context doesn't contain enough information, say so clearly.
-    """
+    today = datetime.now().strftime("%B %d, %Y")
+
+    if is_time_sensitive:
+        temporal_instruction = (
+            f"Today's date is {today}. "
+            "This query asks for CURRENT or LIVE information (scores, standings, prices, news, etc.). "
+            "Treat the provided web results as the authoritative source. "
+            "Your training knowledge may be outdated for this specific topic — "
+            "prefer the provided context over your training cutoff. "
+            "If the context does not contain the exact live data requested, say so clearly "
+            "and suggest where the user can find it."
+        )
+    else:
+        temporal_instruction = (
+            f"Today's date is {today}. "
+            "Use your training knowledge freely alongside the provided context. "
+            "When context and training knowledge agree, synthesise both. "
+            "When they differ, prefer the provided context."
+        )
+
+    system_prompt = f"""You are Project Morningstar, a research assistant.
+{temporal_instruction}
+Synthesize a clear, accurate answer using the provided context.
+Always cite your sources naturally in the text.
+If the context doesn't contain enough information, say so clearly."""
 
     user_prompt = f"""
 Query: {query}
@@ -340,7 +473,8 @@ Provide a comprehensive answer with citations.
 def synthesize_answer(
     query: str,
     documents: list,
-    web_results: Optional[list] = None
+    web_results: Optional[list] = None,
+    is_time_sensitive: bool = False
 ) -> Dict[str, str]:
     """
     Synthesize final answer (blocking). Used by CLI / non-streaming paths.
@@ -348,7 +482,9 @@ def synthesize_answer(
     Returns:
         Dict with 'answer' and 'citations'
     """
-    system_prompt, user_prompt, citations = _build_synthesis_prompts(query, documents, web_results)
+    system_prompt, user_prompt, citations = _build_synthesis_prompts(
+        query, documents, web_results, is_time_sensitive
+    )
     answer = chat_with_ollama(system_prompt=system_prompt, user_prompt=user_prompt, temperature=0.7)
     return {'answer': answer, 'citations': citations}
 
@@ -356,7 +492,8 @@ def synthesize_answer(
 def synthesize_answer_stream(
     query: str,
     documents: list,
-    web_results: Optional[list] = None
+    web_results: Optional[list] = None,
+    is_time_sensitive: bool = False
 ):
     """
     Synthesize final answer as a token stream (generator).
@@ -377,7 +514,9 @@ def synthesize_answer_stream(
                 placeholder.markdown(full + "▌")
         placeholder.markdown(full)
     """
-    system_prompt, user_prompt, citations = _build_synthesis_prompts(query, documents, web_results)
+    system_prompt, user_prompt, citations = _build_synthesis_prompts(
+        query, documents, web_results, is_time_sensitive
+    )
 
     messages = [
         {'role': 'system', 'content': system_prompt},

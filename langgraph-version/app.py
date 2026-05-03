@@ -653,6 +653,9 @@ with chat_tab:
                 "rewritten_query": "",
                 "query_intent": None,
                 "sub_queries": [],
+                "keywords": [],
+                "primary_terms": [],
+                "is_time_sensitive": False,
                 "collections_tried": [],
                 "retrieved_docs": [],
                 "web_search_performed": False,
@@ -687,6 +690,7 @@ with chat_tab:
                 # Track retrieved docs / web_results so we can stream the synthesis
                 final_retrieved_docs = []
                 final_web_results = []
+                final_time_sensitive = False
 
                 try:
                     for event in app.stream(initial_state, config=config):
@@ -717,6 +721,8 @@ with chat_tab:
                             final_confidence = state_update["confidence_score"]
                         if state_update.get("web_search_performed"):
                             used_web = True
+                        if state_update.get("is_time_sensitive") is not None:
+                            final_time_sensitive = state_update["is_time_sensitive"]
                         # Use `is not None` so we correctly capture analyst setting
                         # retrieved_docs=[] (empty list is falsy but meaningful).
                         retrieved = state_update.get("retrieved_docs")
@@ -739,7 +745,8 @@ with chat_tab:
                     for chunk in synthesize_answer_stream(
                         query=prompt,
                         documents=final_retrieved_docs,
-                        web_results=web_for_stream
+                        web_results=web_for_stream,
+                        is_time_sensitive=final_time_sensitive
                     ):
                         if isinstance(chunk, dict):
                             # Last item — citations emitted by the generator

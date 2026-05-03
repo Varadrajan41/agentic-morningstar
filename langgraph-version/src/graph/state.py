@@ -44,6 +44,18 @@ class MorningstarState(TypedDict):
     # for parallel retrieval; simple queries stay as a single-element list.
     sub_queries: List[str]
 
+    # Keyword extraction (set by decomposer_node alongside sub_queries)
+    # keywords:      all significant search terms stripped of filler words
+    # primary_terms: the core must-match terms — if a doc doesn't mention any
+    #                of these it is almost certainly irrelevant and can skip LLM
+    keywords: List[str]
+    primary_terms: List[str]
+
+    # True when the query asks for live/current/recent data (scores, prices,
+    # news, standings, etc.). Controls whether synthesis uses training knowledge
+    # freely or explicitly defers to web results.
+    is_time_sensitive: bool
+
     # Retrieval tracking
     collections_tried: List[str]
     retrieved_docs: List[Document]

@@ -9,6 +9,7 @@ This implements a fully agentic research assistant with:
 """
 import os
 import threading
+from datetime import datetime, date
 from typing import Literal
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -23,13 +24,15 @@ from src.config import (
     LLM_MODEL, EMBEDDING_MODEL,
     COLLECTION_DAILY, COLLECTION_DEEP,
     CONFIDENCE_THRESHOLD, MAX_RETRIES,
-    ENABLE_SMART_WEB_INGESTION, WEB_INGEST_MIN_SCORE
+    ENABLE_SMART_WEB_INGESTION, WEB_INGEST_MIN_SCORE,
+    TIME_SENSITIVE_MAX_AGE_DAYS
 )
 from src.tools.chroma_tools import get_chroma_manager
 from src.tools.search_tools import web_search_with_extraction
 from src.tools.llm_tools import (
     analyze_document_relevance,
     decompose_query,
+    rewrite_query_for_web,
     synthesize_answer,
     synthesize_answer_stream,
     rewrite_query_with_history,
@@ -89,13 +92,23 @@ def decomposer_node(state: MorningstarState) -> MorningstarState:
     query = state.get("rewritten_query") or state["query"]
     intent = state["query_intent"].value if state["query_intent"] else "research"
 
-    # Only attempt decomposition for multi-concept intents
+    # Only attempt decomposition (+ keyword extraction) for multi-concept intents
     if state["query_intent"] in [QueryIntent.COMPARISON, QueryIntent.RESEARCH, QueryIntent.EXPLORATION]:
-        sub_queries = decompose_query(query, intent)
+        result = decompose_query(query, intent)
     else:
-        sub_queries = [query]
+        # For simple factual/summary queries still extract keywords via decompose_query
+        # (it always returns a safe dict) so downstream prefilter has terms to work with
+        result = decompose_query(query, intent)
 
-    state["sub_queries"] = sub_queries
+    sub_queries      = result["sub_queries"]
+    keywords         = result["keywords"]
+    primary_terms    = result["primary_terms"]
+    is_time_sensitive = result.get("is_time_sensitive", False)
+
+    state["sub_queries"]       = sub_queries
+    state["keywords"]          = keywords
+    state["primary_terms"]     = primary_terms
+    state["is_time_sensitive"] = is_time_sensitive
 
     if len(sub_queries) > 1:
         state["agent_reasoning"].append(
@@ -106,6 +119,13 @@ def decomposer_node(state: MorningstarState) -> MorningstarState:
             state["agent_reasoning"].append(f"  Sub-query {i}: '{display}'")
     else:
         state["agent_reasoning"].append("Decomposer: Single-concept query — no decomposition needed")
+
+    if primary_terms:
+        ts_label = " | ⏰ time-sensitive" if is_time_sensitive else ""
+        state["agent_reasoning"].append(
+            f"Decomposer: Keywords extracted — primary: {primary_terms}, "
+            f"all: {keywords}{ts_label}"
+        )
 
     return state
 
@@ -185,13 +205,67 @@ def analyst_node(state: MorningstarState) -> MorningstarState:
     Mirrors the scoring from digest_generator.py and web_Scout.py
     """
     if not state["retrieved_docs"]:
-        state["confidence_score"] = 0.0
-        state["needs_web_fallback"] = True
-        state["agent_reasoning"].append("Analyst: No documents retrieved, confidence = 0.0")
+        web_results = state.get("web_results", [])
+        if web_results:
+            # Web fallback already ran and returned results.
+            # We have no KB docs to score, but web results ARE available for
+            # synthesis — set a moderate confidence so the writer proceeds
+            # and the UI shows a meaningful (not misleading 0%) confidence.
+            web_confidence = 0.5  # Web-sourced answers are moderately confident
+            state["confidence_score"] = web_confidence
+            state["needs_web_fallback"] = False
+            state["agent_reasoning"].append(
+                f"Analyst: No KB docs — using {len(web_results)} web result(s), "
+                f"confidence = {web_confidence:.2f}"
+            )
+        else:
+            state["confidence_score"] = 0.0
+            state["needs_web_fallback"] = True
+            state["agent_reasoning"].append("Analyst: No documents retrieved, confidence = 0.0")
         return state
     
     # Score all documents in parallel (one LLM call per doc → ThreadPoolExecutor)
-    query = state.get("rewritten_query", state["query"])
+    query         = state.get("rewritten_query", state["query"])
+    primary_terms = state.get("primary_terms", [])
+
+    # --- Keyword pre-filter (cheap, zero LLM calls) ----------------------------
+    # Match each doc's title + opening 500 chars against primary_terms.
+    # Docs that don't mention ANY primary term are almost certainly irrelevant
+    # and get auto-scored 1 without wasting an Ollama call.
+    def _passes_prefilter(doc: dict) -> bool:
+        if not primary_terms:
+            return True  # No terms extracted → skip filter (safety net)
+        title = doc["metadata"].get("title", "").lower()
+        head  = title + " " + doc["text"][:500].lower()
+        return any(term in head for term in primary_terms)
+
+    docs_to_score   = []
+    prefiltered_out = []
+    for doc in state["retrieved_docs"]:
+        if _passes_prefilter(doc):
+            docs_to_score.append(doc)
+        else:
+            doc["score"] = 1
+            doc["metadata"]["ai_summary"]   = "Pre-filtered: primary term not found in title/abstract."
+            doc["metadata"]["ai_reasoning"] = "Skipped LLM scoring — no primary keyword match."
+            prefiltered_out.append(doc)
+
+    if prefiltered_out:
+        state["agent_reasoning"].append(
+            f"Analyst: Pre-filter skipped {len(prefiltered_out)} irrelevant doc(s) "
+            f"(primary terms: {primary_terms})"
+        )
+
+    if not docs_to_score:
+        # All docs filtered out — treat same as empty retrieval
+        state["confidence_score"] = 0.0
+        state["needs_web_fallback"] = True
+        state["retrieved_docs"] = []
+        state["agent_reasoning"].append(
+            "Analyst: All docs pre-filtered out — confidence = 0.0"
+        )
+        return state
+    # ---------------------------------------------------------------------------
 
     def score_doc(doc):
         analysis = analyze_document_relevance(
@@ -205,7 +279,7 @@ def analyst_node(state: MorningstarState) -> MorningstarState:
     new_reasoning = []
 
     with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(score_doc, doc): doc for doc in state["retrieved_docs"]}
+        futures = {executor.submit(score_doc, doc): doc for doc in docs_to_score}
         # Preserve original order by keying on the original doc list
         results = {}
         for future in as_completed(futures):
@@ -213,7 +287,7 @@ def analyst_node(state: MorningstarState) -> MorningstarState:
             results[id(futures[future])] = (doc, analysis)
 
     # Rebuild in original order so reasoning steps are predictable
-    for doc in state["retrieved_docs"]:
+    for doc in docs_to_score:
         _, analysis = results[id(doc)]
         score = analysis.get("score", 0)
         doc["score"] = score
@@ -231,7 +305,47 @@ def analyst_node(state: MorningstarState) -> MorningstarState:
     
     # Filter to keep only high-quality docs (score >= 7)
     high_quality = [d for d in scored_docs if d["score"] >= 7]
-    
+
+    # --- Staleness check for time-sensitive queries ----------------------------
+    # Live data (scores, standings, prices, news) expires quickly.
+    # If ALL high-quality docs are older than TIME_SENSITIVE_MAX_AGE_DAYS,
+    # discard them and force a fresh web search regardless of their score.
+    if high_quality and state.get("is_time_sensitive", False):
+        today = date.today()
+        fresh_docs = []
+        stale_count = 0
+        for doc in high_quality:
+            date_str = doc["metadata"].get("date_ingested", "")
+            try:
+                doc_date = datetime.strptime(date_str, "%Y-%m-%d").date()
+                age_days = (today - doc_date).days
+                if age_days <= TIME_SENSITIVE_MAX_AGE_DAYS:
+                    fresh_docs.append(doc)
+                else:
+                    stale_count += 1
+            except (ValueError, TypeError):
+                # No parseable date → treat as fresh (don't penalise old-format docs)
+                fresh_docs.append(doc)
+
+        if stale_count > 0:
+            state["agent_reasoning"].append(
+                f"Analyst: {stale_count} high-quality doc(s) are stale "
+                f"(>{TIME_SENSITIVE_MAX_AGE_DAYS}d old) for a time-sensitive query"
+            )
+
+        if not fresh_docs and stale_count > 0:
+            # All high-scoring docs are stale → force web search for fresh data
+            state["agent_reasoning"].append(
+                "Analyst: All KB results are stale — forcing web search for live data"
+            )
+            state["retrieved_docs"] = []
+            state["confidence_score"] = 0.0
+            state["needs_web_fallback"] = True
+            return state
+
+        high_quality = fresh_docs  # keep only fresh docs for synthesis
+    # ---------------------------------------------------------------------------
+
     # Calculate overall confidence
     if high_quality:
         avg_score = sum(d["score"] for d in high_quality) / len(high_quality)
@@ -267,14 +381,30 @@ def web_scout_node(state: MorningstarState) -> MorningstarState:
     If smart ingestion is enabled, high-quality web results are
     automatically added to the knowledge base for future queries.
     """
-    query = state.get("rewritten_query", state["query"])
-    
-    state["agent_reasoning"].append(f"Web Scout: Searching web for '{query[:50]}...'")
-    
+    query    = state.get("rewritten_query", state["query"])
+    keywords = state.get("keywords", [])
+
+    # Build DDG search query from pre-extracted keywords (no extra LLM call).
+    # keywords were already extracted by decomposer_node, stripped of filler,
+    # and capped at the most relevant terms.  Fall back to LLM rewrite only
+    # when the decomposer didn't produce usable keywords (e.g., simple factual
+    # queries that bypassed full decomposition or edge-case fallbacks).
+    if keywords:
+        web_query = " ".join(keywords[:5])   # DDG sweet-spot: ≤5 keyword tokens
+        state["agent_reasoning"].append(
+            f"Web Scout: Search query (from keywords) → '{web_query}'"
+        )
+    else:
+        web_query = rewrite_query_for_web(query)
+        state["agent_reasoning"].append(
+            f"Web Scout: Search query (LLM rewrite) → '{web_query}'"
+        )
+    state["agent_reasoning"].append("Web Scout: Searching web...")
+
     try:
         # Search web
         results = web_search_with_extraction(
-            query=query,
+            query=web_query,
             max_results=5,
             extract_full=False  # Just snippets for now
         )
@@ -289,12 +419,32 @@ def web_scout_node(state: MorningstarState) -> MorningstarState:
                 full_text=r.get("full_text")
             )
             web_results.append(sr)
-        
+
+        # --- Primary-term filter (reuses same logic as KB prefilter) -----------
+        # Drop web results whose title+snippet don't mention any primary term.
+        # This removes DDG noise like off-topic blog posts, event pages, etc.
+        # When primary_terms is empty (edge case) all results pass through.
+        primary_terms = state.get("primary_terms", [])
+        if primary_terms:
+            def _web_relevant(r) -> bool:
+                haystack = (r["title"] + " " + (r["snippet"] or "")).lower()
+                return any(term in haystack for term in primary_terms)
+
+            filtered   = [r for r in web_results if _web_relevant(r)]
+            n_dropped  = len(web_results) - len(filtered)
+            if n_dropped:
+                state["agent_reasoning"].append(
+                    f"Web Scout: Dropped {n_dropped} off-topic result(s) "
+                    f"(primary terms: {primary_terms})"
+                )
+            web_results = filtered
+        # -----------------------------------------------------------------------
+
         state["web_results"] = web_results
         state["web_search_performed"] = True
         state["web_search_count"] = state.get("web_search_count", 0) + 1
-        
-        state["agent_reasoning"].append(f"Web Scout: Found {len(web_results)} web results")
+
+        state["agent_reasoning"].append(f"Web Scout: Found {len(web_results)} relevant web results")
         
         # Smart Ingestion: Learn from high-quality web results in a background
         # thread so the query response is never blocked by embedding calls.
@@ -316,7 +466,7 @@ def web_scout_node(state: MorningstarState) -> MorningstarState:
 
             thread = threading.Thread(
                 target=_background_ingest,
-                args=(web_dicts, query),
+                args=(web_dicts, web_query),  # use reformulated query as context
                 daemon=True  # Dies automatically when main process exits
             )
             thread.start()
@@ -498,6 +648,9 @@ def main():
         "rewritten_query": "",
         "query_intent": None,
         "sub_queries": [],
+        "keywords": [],
+        "primary_terms": [],
+        "is_time_sensitive": False,
         "collections_tried": [],
         "retrieved_docs": [],
         "web_search_performed": False,
@@ -525,7 +678,12 @@ def main():
     # Blocking synthesis for CLI (Streamlit uses the streaming path)
     docs = result.get("retrieved_docs", [])
     web = result.get("web_results") or None
-    synthesis = synthesize_answer(query=result["query"], documents=docs, web_results=web)
+    synthesis = synthesize_answer(
+        query=result["query"],
+        documents=docs,
+        web_results=web,
+        is_time_sensitive=result.get("is_time_sensitive", False)
+    )
     logger.info(f"Answer: {synthesis['answer']}")
     for cite in synthesis.get('citations', []):
         logger.info(f"  • {cite}")

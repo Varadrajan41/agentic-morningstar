@@ -24,10 +24,13 @@ def web_search(query: str, max_results: int = WEB_SEARCH_MAX_RESULTS) -> List[Di
     """
     try:
         with DDGS() as ddgs:
-            # Quote query for exact phrase matching to avoid ambiguity
-            # (e.g., "RAG" being interpreted as ragtime music)
-            quoted_query = f'"{query}"'
-            results = ddgs.text(quoted_query, backend="html", max_results=max_results)
+            # Quote only short (≤3 word) queries to avoid ambiguity
+            # (e.g., "RAG" → "RAG" prevents ragtime music results).
+            # Long sentences must NOT be quoted — exact-phrase matching on a full
+            # sentence returns near-zero results on DuckDuckGo.
+            words = query.split()
+            search_query = f'"{query}"' if len(words) <= 3 else query
+            results = ddgs.text(search_query, backend="html", max_results=max_results)
             
             return [
                 {
