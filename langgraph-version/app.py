@@ -4,12 +4,19 @@ Streamlit UI for Agentic Morningstar - LangGraph Version.
 Mirrors the original Project Morningstar UI but with agentic backend.
 Features real-time agent reasoning display like Claude/ChatGPT.
 """
+import json
 import os
 import sys
 import uuid
+from datetime import datetime
+from pathlib import Path
 
 # Add src to path
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# Load .env before any LangChain/LangGraph imports so LANGCHAIN_* vars are set
+from dotenv import load_dotenv
+load_dotenv()
 
 import sqlite3
 import streamlit as st
@@ -41,6 +48,76 @@ from src.ingestion.rss_fetcher import (
 from src.tools.llm_tools import generate_arxiv_query, synthesize_answer_stream
 from src.config import LLM_MODEL, ENABLE_SMART_WEB_INGESTION, ARXIV_MAX_RESULTS, ARXIV_MIN_SCORE
 
+# ---------------------------------------------------------------------------
+# Session management helpers
+# Sessions are persisted in sessions.json so they survive Streamlit restarts.
+# Each session maps to a unique LangGraph thread_id (SqliteSaver checkpoint).
+# ---------------------------------------------------------------------------
+
+MAX_HISTORY = 20  # max messages passed to the graph (prevents unbounded token growth)
+SESSIONS_FILE = Path("./sessions.json")
+
+
+def _load_sessions():
+    if not SESSIONS_FILE.exists():
+        return []
+    try:
+        return json.loads(SESSIONS_FILE.read_text())
+    except Exception:
+        return []
+
+
+def _save_sessions(sessions: list) -> None:
+    SESSIONS_FILE.write_text(json.dumps(sessions, indent=2, ensure_ascii=False))
+
+
+def _save_current_session() -> None:
+    """Persist the active session (name + messages) to sessions.json."""
+    thread_id = st.session_state.get("thread_id")
+    if not thread_id:
+        return
+    sessions = _load_sessions()
+    name = st.session_state.get("session_name", "Unnamed Session")
+    messages = st.session_state.get("messages", [])
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    for s in sessions:
+        if s["id"] == thread_id:
+            s["name"] = name
+            s["messages"] = messages
+            s["updated_at"] = now
+            break
+    else:
+        sessions.append({
+            "id": thread_id,
+            "name": name,
+            "created_at": now,
+            "updated_at": now,
+            "messages": messages,
+        })
+    _save_sessions(sessions)
+
+
+def _start_new_session(name: str = "New Session") -> None:
+    """Save current session and start a blank one."""
+    _save_current_session()
+    st.session_state.thread_id = str(uuid.uuid4())
+    st.session_state.messages = []
+    st.session_state.session_name = name
+
+
+def _switch_session(session: dict) -> None:
+    """Save current session then load a saved one."""
+    _save_current_session()
+    st.session_state.thread_id = session["id"]
+    st.session_state.messages = session.get("messages", [])
+    st.session_state.session_name = session["name"]
+
+
+def _delete_session(session_id: str) -> None:
+    sessions = [s for s in _load_sessions() if s["id"] != session_id]
+    _save_sessions(sessions)
+
+
 # Node icons for visual feedback
 NODE_ICONS = {
     "router": "🎯",
@@ -71,8 +148,59 @@ st.caption("Autonomous Research Assistant with Agentic RAG - Real-time Reasoning
 
 # --- SIDEBAR ---
 with st.sidebar:
+    # ── Session Manager (must be first so thread_id/messages are set before anything reads them) ──
+    st.subheader("🗂️ Sessions")
+
+    # Bootstrap session state on first run
+    if "session_name" not in st.session_state:
+        st.session_state.session_name = "Session 1"
+    if "thread_id" not in st.session_state:
+        st.session_state.thread_id = str(uuid.uuid4())
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+
+    # Current session: editable name + save button
+    col_name, col_save = st.columns([3, 1])
+    with col_name:
+        edited_name = st.text_input(
+            "Session name",
+            value=st.session_state.session_name,
+            label_visibility="collapsed",
+            key="session_name_input",
+        )
+        if edited_name != st.session_state.session_name:
+            st.session_state.session_name = edited_name
+    with col_save:
+        if st.button("💾", help="Save this session"):
+            _save_current_session()
+            st.toast("Session saved!")
+
+    if st.button("➕ New Session", use_container_width=True):
+        _start_new_session()
+        st.rerun()
+
+    # List saved sessions (excluding the one currently active)
+    _all_sessions = _load_sessions()
+    _other_sessions = [s for s in _all_sessions if s["id"] != st.session_state.thread_id]
+    if _other_sessions:
+        st.caption("**Saved sessions:**")
+        for _s in reversed(_other_sessions[-6:]):   # newest first, show up to 6
+            _col_lbl, _col_load, _col_del = st.columns([4, 1, 1])
+            with _col_lbl:
+                st.caption(f"**{_s['name']}** · {_s.get('updated_at', _s.get('created_at', ''))}")
+            with _col_load:
+                if st.button("📂", key=f"load_{_s['id']}", help="Switch to this session"):
+                    _switch_session(_s)
+                    st.rerun()
+            with _col_del:
+                if st.button("🗑️", key=f"del_{_s['id']}", help="Delete this session"):
+                    _delete_session(_s["id"])
+                    st.rerun()
+
+    st.markdown("---")
+
     st.header("⚙️ Configuration")
-    
+
     # Collection selection
     st.subheader("Search Collections")
     use_daily = st.checkbox("Fast Cards (daily_research)", value=True)
@@ -495,13 +623,6 @@ with kb_tab:
 # --- CHAT INTERFACE TAB ---
 with chat_tab:
 
-    # Initialize session state
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-
-    if "thread_id" not in st.session_state:
-        st.session_state.thread_id = str(uuid.uuid4())
-
     # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -544,7 +665,10 @@ with chat_tab:
                 "citations": [],
                 "retry_count": 0,
                 "should_retry": False,
-                "messages": [{"role": "user", "content": m["content"]} for m in st.session_state.messages],
+                "messages": [
+                    {"role": m["role"], "content": m["content"]}
+                    for m in st.session_state.messages[-MAX_HISTORY:]
+                ],
                 "agent_reasoning": []
             }
 
@@ -668,6 +792,27 @@ with chat_tab:
                         "role": "assistant",
                         "content": f"Sorry, I encountered an error: {e}"
                     })
+
+    # --- Export current session ---
+    if st.session_state.get("messages"):
+        st.markdown("---")
+        export_data = json.dumps(
+            {
+                "session_id": st.session_state.thread_id,
+                "session_name": st.session_state.get("session_name", "Session"),
+                "exported_at": datetime.now().isoformat(),
+                "messages": st.session_state.messages,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        st.download_button(
+            label="📤 Export Chat",
+            data=export_data,
+            file_name=f"morningstar_{st.session_state.get('session_name', 'chat').replace(' ', '_')}.json",
+            mime="application/json",
+            help="Download this conversation as JSON",
+        )
 
 # --- FOOTER ---
 st.markdown("---")

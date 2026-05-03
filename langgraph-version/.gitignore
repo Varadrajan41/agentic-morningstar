@@ -40,7 +40,8 @@ Thumbs.db
 *.log
 morningstar.log
 
-# User data (feeds, backups, memory)
+# User data (feeds, sessions, backups, memory)
 rss_feeds.json
+sessions.json
 morningstar_backups/
 morningstar_memory.db
